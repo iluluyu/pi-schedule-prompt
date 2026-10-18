@@ -56,6 +56,8 @@ export interface CronJob {
   displayOn?: DisplayMode;
   /** Subagent jobs only. Keep one agent session alive across fires instead of a fresh session per tick — gives the heartbeat trend memory — and allow ad-hoc `action="ask"` interrogation. Requires `model`. */
   resident?: boolean;
+  /** Subagent jobs only. Minutes a resident session may live before it is disposed and re-seeded (with a handoff summary) on the next beat. Bounds memory drift and token spend; 0 disables the time bound (the ~120k-char transcript bound still applies). Default 60. */
+  residentTtlMinutes?: number;
   /** Optional briefing embedded once when a resident session is created (or re-seeded after a reset). */
   contextNote?: string;
   /** Outcome of the last subagent run: healthy, anomalous-but-successful, or failed. */
@@ -161,7 +163,14 @@ export const CronToolParams = Type.Object({
   resident: Type.Optional(
     Type.Boolean({
       description:
-        "Subagent jobs only (requires model). Keep one agent session alive across fires — the heartbeat remembers previous beats and trends — and enable action='ask' to interrogate it ad hoc. The session resets automatically when its transcript grows too large, carrying a handoff summary.",
+        "Subagent jobs only (requires model). Keep one agent session alive across fires — the heartbeat remembers previous beats and trends — and enable action='ask' to interrogate it ad hoc. Short-lived by default: the session is disposed and re-seeded with a handoff after residentTtlMinutes (default 60) or ~120k transcript chars, whichever comes first. Without resident, each beat spawns a fresh visible subagent (via the pi-subagents extension when present) whose trend context is fed from the run archive.",
+    })
+  ),
+  residentTtlMinutes: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: 10080,
+      description: "Subagent jobs only. Resident session lifetime in minutes before dispose-and-reseed with a handoff (default 60; 0 = chars bound only).",
     })
   ),
   contextNote: Type.Optional(

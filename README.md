@@ -274,13 +274,15 @@ schedule_prompt action="logs"                          → per-job summary (runs
 
 **Wake suppression.** With `notifyOn: "anomaly"`, a *persistent* anomaly wakes the parent only on its first beat and then every 4th consecutive one — a lingering condition cannot ring every tick. The widget's `⚠` and the archive keep it visible between wakes, and a display-only recovery marker fires when the job returns to healthy.
 
-**Resident heartbeat agents.** Add `resident: true` (with `model`) to keep one agent session alive across beats instead of a fresh session per tick: the heartbeat remembers earlier beats and reports trends. The session is seeded once with a bounded text-only digest of the parent session plus your `contextNote`, pins its resolved model at creation, and resets automatically with a handoff summary when its transcript outgrows ~120k chars. The main agent can talk to it on demand:
+**Resident heartbeat agents.** Add `resident: true` (with `model`) to keep one agent session alive across beats instead of a fresh session per tick: the heartbeat remembers earlier beats and reports trends. The session is seeded once with a bounded text-only digest of the parent session plus your `contextNote`, pins its resolved model at creation, and is **short-lived by design**: it is disposed and re-seeded with a handoff summary after `residentTtlMinutes` (default 60; `0` disables the time bound) or ~120k transcript chars — whichever comes first. The main agent can talk to it on demand:
 
 ```
 schedule_prompt action="ask" jobId="abc123" question="why did GPU memory jump at beat 12?"
 ```
 
 `ask` is inspection-only: it archives `kind:"ask"` entries but never advances beat counters, evaluates `stopOn`, or triggers notifications. Beats and asks share one busy guard — asking during a beat returns a retryable busy error. Use `action="transcript"` (`jobId`, optional `tail`) to view the resident session's live dialogue — the equivalent of a subagent conversation viewer for heartbeat agents.
+
+**Default runner (pi-subagents integration).** Without `resident`, every beat of a subagent job is spawned through the [pi-subagents](https://github.com/tintinweb/pi-subagents) extension's cross-extension RPC when it is loaded — so each beat appears in your existing `/agents` conversation views: scroll the dialogue, and **steer a running beat directly** with the viewer's composer. Trend memory is fed statelessly by prepending the job's last five archived runs to each beat prompt. When pi-subagents is absent, beats fall back to the built-in in-process runner (`job.extensions`/`job.skills` apply only to that fallback — RPC beats use the spawned agent type's own configuration).
 
 **Progress convention (`STATUS:`).** Every subagent beat prompt gets a one-line suffix asking the agent to make the **first line** of its reply exactly `STATUS: <one-line plain-text progress summary>`. The scheduler extracts that line (first non-empty line only — a `STATUS:` quoted deeper in the output does not count), strips terminal escape sequences, caps it at 240 chars, and persists it as the job's `lastStatusLine`. The compact widget renders it as a live progress readout:
 

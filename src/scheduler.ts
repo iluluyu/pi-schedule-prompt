@@ -1,7 +1,7 @@
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import * as path from "path";
-import { archiveRun } from "./run-log.js";
+import { archiveRun, readRuns } from "./run-log.js";
 import type { CronStorage } from "./storage.js";
 import {
   createSubagentSession,
@@ -12,6 +12,7 @@ import {
   type SubagentHandle,
   type SubagentResult,
 } from "./subagent.js";
+import { SubagentsRpcClient } from "./subagents-rpc.js";
 import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
 
 /** Result of `CronScheduler.validateSchedule`. On success, `schedule` is the
@@ -68,6 +69,8 @@ function shouldDisplay(job: CronJob, output: string, failed: boolean): boolean {
 const STATUS_LINE_MAX = 240;
 /** Transcript size (chars) at which a resident session resets with a handoff. */
 const RESIDENT_RESET_CHARS = 120_000;
+/** Hard wall-clock cap for a single beat run through any runner. */
+const BEAT_TIMEOUT_MS = 30 * 60_000;
 /** With notifyOn=anomaly, a persistent anomaly re-wakes only every Nth beat. */
 const ALERT_REWAKE_EVERY = 4;
 /** Suffix appended to subagent beat prompts so progress is machine-readable. */
@@ -140,6 +143,7 @@ interface ResidentRecord {
   handle: SubagentHandle;
   beats: number;
   estChars: number;
+  createdAt: number;
 }
 
 /**
@@ -159,6 +163,8 @@ export class CronScheduler {
   private residentSessions = new Map<string, ResidentRecord>();
   /** Handoff summaries carried across resident resets (memory-bounded). */
   private residentHandoffs = new Map<string, string>();
+  /** Default subagent runner: pi-subagents' cross-extension RPC, when present. */
+  private readonly subagentsRpc: SubagentsRpcClient;
 
   constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext, logBaseDir?: string) {
     this.storage = storage;
@@ -168,6 +174,7 @@ export class CronScheduler {
     // Overridable for tests; defaults into the plugin-owned agent dir so
     // quiet-run archives never land inside the user's project tree.
     this.logBaseDir = logBaseDir ?? path.join(getAgentDir(), "schedule-logs");
+    this.subagentsRpc = new SubagentsRpcClient(pi.events);
   }
 
   /** Base directory of the per-job run archive (see run-log.ts). */
@@ -449,6 +456,18 @@ export class CronScheduler {
     }
   }
 
+  /** Short rolling memory block from the run archive — gives stateless
+   *  per-beat subagents (pi-subagents runner) their trend context. */
+  private recentBeatsMemory(job: CronJob): string {
+    const runs = readRuns(this.logBaseDir, this.ctx.cwd, job.id, 5);
+    if (runs.length === 0) return "";
+    const blocks = runs.map((r) => {
+      const body = (r.output ?? r.error ?? "").slice(0, 800);
+      return `[${r.ts}] ${r.outcome}${r.kind && r.kind !== "beat" ? ` (${r.kind})` : ""}:\n${body}`;
+    });
+    return `\n\nRecent beats from this job's archive (newest first) — use as your trend memory:\n${blocks.join("\n---\n")}`;
+  }
+
   /** Drop a job's resident session (config change, removal, shutdown). */
   private disposeResident(jobId: string): void {
     const record = this.residentSessions.get(jobId);
@@ -507,18 +526,29 @@ export class CronScheduler {
     const handoff = this.residentHandoffs.get(job.id);
     this.residentHandoffs.delete(job.id);
     const seed = this.buildResidentSeed(job, handoff);
-    const record: ResidentRecord = { handle: created.handle, beats: 0, estChars: seed.length };
+    const record: ResidentRecord = {
+      handle: created.handle,
+      beats: 0,
+      estChars: seed.length,
+      createdAt: Date.now(),
+    };
     this.residentSessions.set(job.id, record);
     return { ok: true, record, seed };
   }
 
-  /** Reset a resident session once its transcript outgrows the bound,
-   *  carrying a handoff summary into the fresh session on the next beat. */
+  /** Reset a resident session once its transcript outgrows the bound or its
+   *  TTL expires — whichever comes first — carrying a handoff summary into
+   *  the fresh session on the next beat. Bounds both memory drift and token
+   *  spend: a slow heartbeat cannot accumulate weeks of stale context. */
   private maybeResetResident(job: CronJob, lastOutput: string): void {
     const record = this.residentSessions.get(job.id);
-    if (!record || record.estChars <= RESIDENT_RESET_CHARS) return;
+    if (!record) return;
+    const ttlMinutes = job.residentTtlMinutes ?? 60;
+    const ttlExpired = ttlMinutes > 0 && Date.now() - record.createdAt > ttlMinutes * 60_000;
+    if (!ttlExpired && record.estChars <= RESIDENT_RESET_CHARS) return;
     const handoff = [
       `Beats completed in your previous session: ${record.beats}.`,
+      `Reset reason: ${ttlExpired ? `session age exceeded ${ttlMinutes} minutes` : "transcript size bound reached"}.`,
       job.lastStatusLine ? `Last status line: ${job.lastStatusLine}` : "",
       `Last beat output (truncated):\n${lastOutput.slice(0, 2000)}`,
       "Carry forward any open anomalies and baselines from your memory; re-summarize them in your next reply if still relevant.",
@@ -528,7 +558,7 @@ export class CronScheduler {
     this.residentHandoffs.set(job.id, handoff);
     this.disposeResident(job.id);
     console.log(
-      `[pi-schedule-prompt] resident session for job ${job.id} reset (transcript bound ${RESIDENT_RESET_CHARS} chars)`,
+      `[pi-schedule-prompt] resident session for job ${job.id} reset (${ttlExpired ? `ttl ${ttlMinutes}m` : `transcript bound ${RESIDENT_RESET_CHARS} chars`})`,
     );
   }
 
@@ -696,6 +726,30 @@ export class CronScheduler {
               beatPrompt.length + (result.ok ? result.text.length : result.error.length);
             if (result.ok) this.maybeResetResident(job, result.text);
           }
+        } finally {
+          this.activeSubagents.delete(controller);
+        }
+      } else if (await this.subagentsRpc.ready()) {
+        // Default runner: spawn through pi-subagents so every beat shows up in
+        // the user's /agents conversation views (scrollable, steerable). Trend
+        // memory comes from the run archive instead of a live session.
+        try {
+          const handle = `hb-${job.name}`
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+|-+$/g, "")
+            .slice(0, 32);
+          result = await this.subagentsRpc.spawnAndWait(
+            {
+              type: "general-purpose",
+              prompt: `${job.prompt}${STATUS_CONVENTION}${this.recentBeatsMemory(job)}`,
+              name: handle || "hb",
+              description: `heartbeat: ${job.name}`,
+              model: requestedModel,
+              isBackground: true,
+            },
+            BEAT_TIMEOUT_MS,
+          );
         } finally {
           this.activeSubagents.delete(controller);
         }

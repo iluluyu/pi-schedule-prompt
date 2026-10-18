@@ -1121,6 +1121,27 @@ describe("CronScheduler — resident sessions, status lines, alert suppression",
     expect(seed).not.toContain("huge tool payload");
   });
 
+  it("disposes a resident session when its TTL expires (default 60m)", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "STATUS: ok\nHEARTBEAT_OK" });
+    const job = residentJob({ residentTtlMinutes: 60 });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).runCount).toBe(1));
+
+    // Age the session past its TTL, then run another beat.
+    (scheduler as any).residentSessions.get(job.id).createdAt = Date.now() - 61 * 60_000;
+    await (scheduler as any).executeJobInSubagent(storage.getJob(job.id)!);
+    await vi.waitFor(() => expect(storage.getJob(job.id).runCount).toBe(2));
+
+    expect(session.abort).toHaveBeenCalled(); // TTL reset disposed the old session
+    expect((scheduler as any).residentHandoffs.get(job.id)).toContain("session age exceeded 60 minutes");
+    expect((scheduler as any).residentSessions.size).toBe(0);
+  });
+
   it("residentTranscript returns the live dialogue; errors guide non-resident jobs to logs", async () => {
     const session = {
       abort: vi.fn(),
@@ -1151,5 +1172,104 @@ describe("CronScheduler — resident sessions, status lines, alert suppression",
     const err = scheduler2.residentTranscript("plain2");
     expect(err.ok).toBe(false);
     expect(err.ok === false && err.error).toContain('action="logs"');
+  });
+});
+
+describe("CronScheduler — pi-subagents RPC runner", () => {
+  beforeEach(() => {
+    mockRunSubagentOnce.mockReset();
+    mockArchiveRun.mockReset();
+    mockCreateSubagentSession.mockReset();
+    mockPromptSubagentSession.mockReset();
+  });
+
+  /** Functional mini event bus — replies SYNCHRONOUSLY inside emit(), exactly
+   *  like pi's in-process event bus (see pi-subagents docs/rpc.md). */
+  function makeRpcPi(opts: { agentId?: string; result?: string; fail?: boolean } = {}) {
+    const agentId = opts.agentId ?? "agent-1";
+    const handlers = new Map<string, ((data: any) => void)[]>();
+    const dispatch = (event: string, data: any) => {
+      for (const h of handlers.get(event) ?? []) h(data);
+    };
+    return {
+      sendMessage: vi.fn(),
+      sendUserMessage: vi.fn(),
+      events: {
+        on: (event: string, handler: (data: any) => void) => {
+          const list = handlers.get(event) ?? [];
+          list.push(handler);
+          handlers.set(event, list);
+          return () => {
+            handlers.set(event, (handlers.get(event) ?? []).filter((h) => h !== handler));
+          };
+        },
+        emit: (event: string, data: any) => {
+          // Host handlers are async wrappers — replies land on microtasks, and
+          // lifecycle events strictly after the spawn reply resolves.
+          if (event === "subagents:rpc:ping") {
+            queueMicrotask(() => dispatch(`${event}:reply:${data.requestId}`, { success: true, version: 2 }));
+            return;
+          }
+          if (event === "subagents:rpc:spawn") {
+            queueMicrotask(() => {
+              dispatch(`${event}:reply:${data.requestId}`, { success: true, data: agentId });
+              setTimeout(() => {
+                if (opts.fail) {
+                  dispatch("subagents:failed", { id: agentId, error: "agent exploded" });
+                } else {
+                  dispatch("subagents:completed", { id: agentId, result: opts.result ?? "STATUS: rpc ok\nHEARTBEAT_OK" });
+                }
+              }, 5);
+            });
+            return;
+          }
+          dispatch(event, data);
+        },
+      },
+    } as any;
+  }
+
+  it("routes non-resident beats through the RPC runner when available", async () => {
+    const pi = makeRpcPi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(mockRunSubagentOnce).not.toHaveBeenCalled();
+    expect(storage.getJob(job.id).lastOutcome).toBe("ok");
+    expect(storage.getJob(job.id).lastStatusLine).toBe("rpc ok");
+    expect(mockArchiveRun).toHaveBeenCalledTimes(1);
+    expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({ output: "STATUS: rpc ok\nHEARTBEAT_OK" });
+    expect(pi.sendMessage).not.toHaveBeenCalled(); // quiet healthy beat
+  });
+
+  it("falls back to the internal runner when the RPC host is absent", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "STATUS: internal ok\nHEARTBEAT_OK" });
+    const pi = makePi(); // events.on/emit are vi.fn()s → ping never replies
+    const job = exampleJob({ model: "haiku" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(mockRunSubagentOnce).toHaveBeenCalledTimes(1);
+    expect(storage.getJob(job.id).lastStatusLine).toBe("internal ok");
+  });
+
+  it("surfaces a failed RPC run through the error pipeline", async () => {
+    const pi = makeRpcPi({ fail: true });
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("error"));
+
+    expect(storage.getJob(job.id).lastOutcome).toBe("error");
+    expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({ outcome: "error", error: "agent exploded" });
   });
 });

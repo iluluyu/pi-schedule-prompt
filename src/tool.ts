@@ -126,6 +126,7 @@ export function createCronTool(
               notifyOn: (params.notifyOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["notifyOn"],
               displayOn: (params.displayOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["displayOn"],
               resident: params.resident,
+              residentTtlMinutes: params.residentTtlMinutes,
               contextNote: params.contextNote?.slice(0, 4000),
               stopOn: params.stopOn,
               extensions: params.extensions,
@@ -280,6 +281,7 @@ export function createCronTool(
             if (params.notifyOn !== undefined) updates.notifyOn = params.notifyOn as CronJob["notifyOn"];
             if (params.displayOn !== undefined) updates.displayOn = params.displayOn as CronJob["displayOn"];
             if (params.resident !== undefined) updates.resident = params.resident;
+            if (params.residentTtlMinutes !== undefined) updates.residentTtlMinutes = params.residentTtlMinutes;
             if (params.contextNote !== undefined) updates.contextNote = params.contextNote.slice(0, 4000);
             if ((updates.resident ?? job.resident) && !(updates.model ?? job.model)) {
               throw new Error(
