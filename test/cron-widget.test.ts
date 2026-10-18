@@ -23,9 +23,13 @@ function makeScheduler(_jobs: CronJob[]): CronScheduler {
   } as any;
 }
 
-function makeSchedulerWithNextRun(nextRun: Date | null): CronScheduler {
+function makeSchedulerWithNextRun(
+  nextRun: Date | null,
+  periodMs?: number | null,
+): CronScheduler {
   return {
     getNextRun: vi.fn(() => nextRun),
+    ...(periodMs !== undefined ? { getBeatPeriodMs: vi.fn(() => periodMs) } : {}),
     isLoadedFor: vi.fn(() => true),
   } as any;
 }
@@ -98,9 +102,12 @@ function renderWidget(
 
 function renderCompact(
   jobs: CronJob[],
-  opts: { width?: number; nextRun?: Date | null } = {},
+  opts: { width?: number; nextRun?: Date | null; periodMs?: number | null } = {},
 ): string[] {
-  const scheduler = makeSchedulerWithNextRun(opts.nextRun === undefined ? null : opts.nextRun);
+  const scheduler = makeSchedulerWithNextRun(
+    opts.nextRun === undefined ? null : opts.nextRun,
+    opts.periodMs,
+  );
   return renderWidget(jobs, "compact", opts.width ?? 100, scheduler);
 }
 
@@ -131,16 +138,16 @@ describe("CronWidget — compact style", () => {
       lastOutcome: "ok",
     });
     const lines = renderCompact([job], {
-      // 12.5min out: floor() to "in 12m" tolerates test-run drift.
+      // 12.5min out: floor() to "12m" tolerates test-run drift.
       nextRun: new Date(Date.now() + 12.5 * 60 * 1000),
     });
 
     expect(lines).toHaveLength(1);
     const line = lines[0];
-    expect(line).toContain("♥");
+    expect(line).toContain("◆");
     expect(line).toContain("health");
     expect(line).toContain("STATUS: all good");
-    expect(line).toContain("in 12m");
+    expect(line).toContain("12m");
     // No DynamicBorder / table chrome in compact mode.
     expect(line).not.toContain("─");
     expect(line).not.toContain("┌");
@@ -180,10 +187,10 @@ describe("CronWidget — compact style", () => {
     expect(iAnom).toBeLessThan(iOk);
     expect(iOk).toBeLessThan(iOff);
 
-    expect(line).toContain("!");
-    expect(line).toContain("⚠");
-    expect(line).toContain("✓");
-    expect(line).toContain("✗");
+    expect(line).toContain("■");
+    expect(line).toContain("▲");
+    expect(line).toContain("●");
+    expect(line).toContain("○");
   });
 
   it("joins multiple entries with the dot separator", () => {
@@ -239,6 +246,24 @@ describe("CronWidget — compact style", () => {
     expect(lines[0]).toContain("·");
   });
 
+  it("renders a progress bar + total period between beats", () => {
+    const job = exampleJob({
+      id: "1",
+      name: "ticker",
+      lastStatusLine: "ok",
+      intervalMs: 30000,
+      lastRun: new Date(Date.now() - 12000).toISOString(),
+    });
+    const lines = renderCompact([job], {
+      width: 100,
+      periodMs: 30000,
+      nextRun: new Date(Date.now() + 18000),
+    });
+    expect(lines[0]).toContain("30s");
+    expect((lines[0].match(/▪/g) ?? []).length).toBe(2); // filled cells at 40%
+    expect((lines[0].match(/▫/g) ?? []).length).toBe(3); // hollow track cells
+  });
+
   it("caps the compact line at 5 jobs — overflow is hidden, not shown", () => {
     const mk = (id: string, name: string) => exampleJob({ id, name, lastStatusLine: "ok" });
     const jobs = [mk("1", "j-one"), mk("2", "j-two"), mk("3", "j-three"), mk("4", "j-four"), mk("5", "j-five"), mk("6", "j-six"), mk("7", "j-seven")];
@@ -271,7 +296,7 @@ describe("CronWidget — table style", () => {
     expect(joined).toContain("Scheduled Prompts");
     expect(joined).toContain("(1 jobs)");
     expect(joined).toContain("Tabular");
-    expect(joined).toContain("✓");
+    expect(joined).toContain("●");
   });
 });
 

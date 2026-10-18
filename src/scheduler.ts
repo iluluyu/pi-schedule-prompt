@@ -317,6 +317,20 @@ export class CronScheduler {
     return at ? new Date(at) : null;
   }
 
+  /** The job's beat period in ms (interval length or cron period), for
+   *  progress-style countdowns like "17S/30S". Null when unknown. */
+  getBeatPeriodMs(jobId: string): number | null {
+    const cron = this.jobs.get(jobId);
+    if (cron) {
+      const runs = cron.nextRuns(2);
+      return runs.length === 2 && runs[0] && runs[1]
+        ? runs[1].getTime() - runs[0].getTime()
+        : null;
+    }
+    const job = this.storage.getJob(jobId);
+    return job?.intervalMs ?? null;
+  }
+
   /**
    * Schedule a single job
    */

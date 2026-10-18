@@ -33,23 +33,27 @@ function sanitizeStatusLine(line: string): string {
     .trim();
 }
 
-/** Status icon for a job — shared by the table rows and the compact line. */
+/** Status icon for a job — shared by the table rows and the compact line.
+ *  All icons stay in the Geometric Shapes family (font-safe in terminals
+ *  that flatten Dingbats/arrows like ✓ ⟳ ✗ ⚠): ● ok, ◐ running,
+ *  ■ error, ▲ anomaly, ○ disabled. */
 function statusIconFor(job: CronJob, theme: any): string {
   if (!job.enabled) {
-    return theme.fg("muted", "✗");
+    return theme.fg("muted", "○");
   }
   if (job.lastStatus === "running") {
-    return theme.fg("warning", "⟳");
+    // Half-filled circle reads as "in progress" without an arrow glyph.
+    return theme.fg("warning", "◐");
   }
   if (job.lastStatus === "error") {
-    return theme.fg("error", "!");
+    return theme.fg("error", "■");
   }
   if (job.lastOutcome === "anomaly") {
     // Succeeded but the output matched the anomaly regex — surfaced in
     // chat when displayOn allows, still flagged here afterwards.
-    return theme.fg("warning", "⚠");
+    return theme.fg("warning", "▲");
   }
-  return theme.fg("success", "✓");
+  return theme.fg("success", "●");
 }
 
 /** Compact-entry sort rank: needs-attention (error/anomaly/running) first,
@@ -72,29 +76,39 @@ function humanSchedule(job: CronJob): string {
 /**
  * Format relative time (e.g., "in 5m", "2h ago")
  */
-function formatRelativeTime(date: Date | string): string {
-  const now = Date.now();
-  const target = typeof date === "string" ? new Date(date).getTime() : date.getTime();
-  const diff = target - now;
-  const absDiff = Math.abs(diff);
-
-  const seconds = Math.floor(absDiff / 1000);
+/** Go-style lowercase duration tokens (30s / 5m / 2h / 1d) — the convention
+ *  both humans and models parse most reliably; uppercase M would collide
+ *  with ISO-8601 months (P1M) and is the classic misread. */
+function compactToken(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
   const minutes = Math.floor(seconds / 60);
   const hours = Math.floor(minutes / 60);
   const days = Math.floor(hours / 24);
+  if (days > 0) return `${days}d`;
+  if (hours > 0) return `${hours}h`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${seconds}s`;
+}
 
-  let timeStr: string;
-  if (days > 0) {
-    timeStr = `${days}d`;
-  } else if (hours > 0) {
-    timeStr = `${hours}h`;
-  } else if (minutes > 0) {
-    timeStr = `${minutes}m`;
-  } else {
-    timeStr = `${seconds}s`;
-  }
+function formatRelativeTime(date: Date | string, periodMs?: number | null): string {
+  const now = Date.now();
+  const target = typeof date === "string" ? new Date(date).getTime() : date.getTime();
+  const diff = target - now;
+  const token = compactToken(Math.abs(diff));
+  // Fallback form (no last beat yet): bare countdown for the future, "+'"
+  // for the past; a known period appends the total.
+  if (diff > 0) return periodMs ? `${token}/${compactToken(periodMs)}` : token;
+  return `${token}+`;
+}
 
-  return diff > 0 ? `in ${timeStr}` : `${timeStr} ago`;
+/** 5-cell small filled/hollow square meter: "▪▪▫▫▫". Filled=success green,
+ *  hollow track=dim; ~1 char-width tall; resets each fire. Five cells give
+ *  clear at-a-glance estimation (20% per cell) at a compact width, and the
+ *  Geometric Shapes glyphs render natively where Block Elements flatten. */
+function progressBar(elapsedMs: number, periodMs: number, theme: any): string {
+  const cells = 5;
+  const filled = Math.max(0, Math.min(cells, Math.round((elapsedMs / periodMs) * cells)));
+  return `${theme.fg("success", "▪".repeat(filled))}${theme.fg("dim", "▫".repeat(cells - filled))}`;
 }
 
 /**
@@ -144,7 +158,9 @@ export class CronWidget {
     // 30s tick re-renders so relative-time labels ("in 5m") update even when
     // nothing else changes. Same path as cron:change-driven refresh.
     if (!this.refreshInterval) {
-      this.refreshInterval = setInterval(() => this.refresh(), 30000);
+      // 1s tick so the progress bar visibly fills between beats; the render
+      // itself is a single line, so the cost is negligible.
+      this.refreshInterval = setInterval(() => this.refresh(), 1000);
     }
   }
 
@@ -184,7 +200,9 @@ export class CronWidget {
    *  the separators so the line spans the full screen width. */
   private renderCompact(width: number, theme: any): string[] {
     const jobs = this.uniqueJobs().slice().sort((a, b) => compactRank(a) - compactRank(b));
-    const prefix = `${theme.fg("error", "♥")} `;
+    // ◆ diamond (Geometric Shapes — font-safe like ▪▫; card-suit ♥ renders
+    // oddly in some terminal fonts). Red keeps the heartbeat accent.
+    const prefix = `${theme.fg("error", "◆")} `;
     const baseSeparator = " · ";
     const sepWidth = visibleWidth(baseSeparator);
 
@@ -247,8 +265,17 @@ export class CronWidget {
     const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
     const detail = theme.fg("dim", detailRaw);
     const nextRun = this.scheduler.getNextRun(job.id);
+    const period = this.scheduler.getBeatPeriodMs?.(job.id) ?? null;
+    const lastMs = job.lastRun ? new Date(job.lastRun).getTime() : null;
     const parts = [`${icon} ${name}`, detail];
-    if (nextRun) parts.push(formatRelativeTime(nextRun));
+    if (period && lastMs) {
+      // Progress form: 5-cell filled/hollow squares over the beat period
+      // (resets each fire) + the total, e.g. "▪▪▫▫▫ 30s".
+      const elapsed = Math.max(0, Date.now() - lastMs);
+      parts.push(`${progressBar(elapsed, period, theme)} ${compactToken(period)}`);
+    } else if (nextRun) {
+      parts.push(formatRelativeTime(nextRun, period));
+    }
     return parts.join(" ");
   }
 
