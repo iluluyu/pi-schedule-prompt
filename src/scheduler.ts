@@ -1,5 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
+import * as path from "path";
+import { archiveRun } from "./run-log.js";
 import type { CronStorage } from "./storage.js";
 import { modelReference, resolveModel, runSubagentOnce, type SubagentResult } from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
@@ -24,9 +26,26 @@ const ANOMALY_OUTPUT = /\b(?:HEARTBEAT_ALERT|ALERT|CRITICAL|ERROR|FAILED|OOM|DEA
 function shouldNotify(job: CronJob, output: string, failed: boolean): boolean {
   if (job.notifyOn === "never") return false;
   if (job.notifyOn === "always") return true;
-  if (job.notifyOn === "anomaly") return failed || ANOMALY_OUTPUT.test(output);
+  if (job.notifyOn === "anomaly") return failed || isAnomalyOutput(output);
   // Keep the pre-0.5 boolean behavior for existing jobs.
   return job.notify === true;
+}
+
+/** True when the output looks anomalous — shared by the wake and display gates. */
+function isAnomalyOutput(output: string): boolean {
+  return ANOMALY_OUTPUT.test(output);
+}
+
+/** Whether a run marker is *rendered* in the parent chat. Orthogonal to
+ *  `shouldNotify` (wake): a marker is sent when either gate is open, and a
+ *  fully quiet run (both gates closed) sends nothing at all — zero chat
+ *  rows, zero parent-context growth. Classification always uses the full
+ *  untruncated output so an ALERT past the snippet boundary still counts. */
+function shouldDisplay(job: CronJob, output: string, failed: boolean): boolean {
+  if (job.displayOn === "never") return false;
+  if (job.displayOn === "anomaly") return failed || isAnomalyOutput(output);
+  // Undefined/`always` keeps the historical marker behavior for existing jobs.
+  return true;
 }
 
 /**
@@ -41,12 +60,21 @@ export class CronScheduler {
   private readonly pi: ExtensionAPI;
   private readonly ctx: ExtensionContext;
   private currentModel: ExtensionContext["model"];
+  private readonly logBaseDir: string;
 
-  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext) {
+  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext, logBaseDir?: string) {
     this.storage = storage;
     this.pi = pi;
     this.ctx = ctx;
     this.currentModel = ctx.model;
+    // Overridable for tests; defaults into the plugin-owned agent dir so
+    // quiet-run archives never land inside the user's project tree.
+    this.logBaseDir = logBaseDir ?? path.join(getAgentDir(), "schedule-logs");
+  }
+
+  /** Base directory of the per-job run archive (see run-log.ts). */
+  getRunLogBaseDir(): string {
+    return this.logBaseDir;
   }
 
   /** Keep dynamic model aliases aligned with `/model` changes in the parent session. */
@@ -305,37 +333,43 @@ export class CronScheduler {
    * the main model does not leave a heartbeat pinned to an old model.
    */
   private async executeJobInSubagent(job: CronJob): Promise<void> {
+    const startedAt = Date.now();
     const requestedModel = job.model!;
     const resolvedModel = resolveModel(this.ctx.modelRegistry, requestedModel, this.currentModel);
     const model = resolvedModel ? modelReference(resolvedModel) : requestedModel;
     this.storage.updateJob(job.id, { lastStatus: "running" });
     this.emitChange({ type: "fire", job });
 
-    // Start marker needs non-empty content to prevent session poisoning.
-    // Pi-ai's openai-completions provider filters out user messages with
-    // empty content — if the marker lands right after an assistant message,
-    // the conversation ends on assistant and Anthropic 400s.
-    try {
-      this.pi.sendMessage({
-        customType: "scheduled_prompt",
-        content: [{ type: "text", text: `🕐 Scheduled (subagent: ${model}): ${job.name}` }],
-        display: true,
-        details: {
-          jobId: job.id,
-          jobName: job.name,
-          prompt: job.prompt,
-          mode: "subagent_start",
-          model,
-          requestedModel,
-        },
-      });
-    } catch (error) {
-      this.storage.updateJob(job.id, {
-        lastRun: new Date().toISOString(),
-        lastStatus: "error",
-      });
-      console.error(`Failed to post subagent_start marker for job ${job.id}:`, error);
-      return;
+    // Quiet jobs (displayOn anomaly/never) post no start marker: the outcome
+    // is unknown at fire time, so silence is the safe default — the widget's
+    // ⟳ row already communicates "running" without a chat message.
+    if (shouldDisplay(job, "", false)) {
+      // Start marker needs non-empty content to prevent session poisoning.
+      // Pi-ai's openai-completions provider filters out user messages with
+      // empty content — if the marker lands right after an assistant message,
+      // the conversation ends on assistant and Anthropic 400s.
+      try {
+        this.pi.sendMessage({
+          customType: "scheduled_prompt",
+          content: [{ type: "text", text: `🕐 Scheduled (subagent: ${model}): ${job.name}` }],
+          display: true,
+          details: {
+            jobId: job.id,
+            jobName: job.name,
+            prompt: job.prompt,
+            mode: "subagent_start",
+            model,
+            requestedModel,
+          },
+        });
+      } catch (error) {
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(),
+          lastStatus: "error",
+        });
+        console.error(`Failed to post subagent_start marker for job ${job.id}:`, error);
+        return;
+      }
     }
 
     const controller = new AbortController();
@@ -365,6 +399,7 @@ export class CronScheduler {
         const rawOutput = result.text.trim();
         const outputSnippet = snippet(rawOutput) || "(subagent produced no text output)";
         const stopRequested = Boolean(job.stopOn && rawOutput.includes(job.stopOn));
+        const anomalous = isAnomalyOutput(rawOutput);
         // Re-read runCount from storage; `job` here is the closure-captured
         // snapshot from scheduleJob and would yield a stale count.
         const latest = this.storage.getJob(job.id);
@@ -372,6 +407,7 @@ export class CronScheduler {
         this.storage.updateJob(job.id, {
           lastRun: new Date().toISOString(),
           lastStatus: "success",
+          lastOutcome: anomalous ? "anomaly" : "ok",
           runCount: currentRunCount + 1,
           nextRun: nextRun?.toISOString(),
           ...(stopRequested ? { enabled: false } : {}),
@@ -383,30 +419,41 @@ export class CronScheduler {
           this.emitChange({ type: "update", job: { ...job, enabled: false } });
         }
         this.emitChange({ type: "fire", job });
-        try {
-          // A recurring heartbeat should normally use notifyOn="anomaly";
-          // healthy results remain visible but do not wake the parent model.
-          this.pi.sendMessage(
-            {
-              customType: "scheduled_prompt",
-              content: [{ type: "text", text: outputSnippet }],
-              display: true,
-              details: {
-                jobId: job.id,
-                jobName: job.name,
-                prompt: job.prompt,
-                mode: "subagent_done",
-                model,
-                requestedModel,
-                output: outputSnippet,
+        archiveRun(this.logBaseDir, this.ctx.cwd, job.id, {
+          ts: new Date().toISOString(),
+          outcome: anomalous ? "anomaly" : "ok",
+          model,
+          requestedModel,
+          durationMs: Date.now() - startedAt,
+          output: rawOutput || undefined,
+        });
+        // Quiet healthy runs (display gate closed + no wake): no marker at
+        // all — zero chat rows, zero parent-context growth. The run stays
+        // visible in the widget and in the on-disk archive (action="logs").
+        const displayEligible = shouldDisplay(job, rawOutput, false);
+        const wakeEligible = shouldNotify(job, rawOutput, false);
+        if (displayEligible || wakeEligible) {
+          try {
+            this.pi.sendMessage(
+              {
+                customType: "scheduled_prompt",
+                content: [{ type: "text", text: outputSnippet }],
+                display: displayEligible,
+                details: {
+                  jobId: job.id,
+                  jobName: job.name,
+                  prompt: job.prompt,
+                  mode: "subagent_done",
+                  model,
+                  requestedModel,
+                  output: outputSnippet,
+                },
               },
-            },
-            shouldNotify(job, rawOutput, false)
-              ? { deliverAs: "followUp", triggerTurn: true }
-              : undefined,
-          );
-        } catch (markerErr) {
-          console.error(`Failed to post subagent_done marker for job ${job.id}:`, markerErr);
+              wakeEligible ? { deliverAs: "followUp", triggerTurn: true } : undefined,
+            );
+          } catch (markerErr) {
+            console.error(`Failed to post subagent_done marker for job ${job.id}:`, markerErr);
+          }
         }
       } else {
         // Truncate the error the same way as the success snippet — verbose
@@ -415,32 +462,45 @@ export class CronScheduler {
         this.storage.updateJob(job.id, {
           lastRun: new Date().toISOString(),
           lastStatus: "error",
+          lastOutcome: "error",
           nextRun: nextRun?.toISOString(),
         });
         this.emitChange({ type: "error", jobId: job.id, error: errorSnippet });
-        try {
-          // Same notify-gated wake-up as the done marker — see comment above.
-          this.pi.sendMessage(
-            {
-              customType: "scheduled_prompt",
-              content: [{ type: "text", text: errorSnippet }],
-              display: true,
-              details: {
-                jobId: job.id,
-                jobName: job.name,
-                prompt: job.prompt,
-                mode: "subagent_error",
-                model,
-                requestedModel,
-                error: errorSnippet,
+        archiveRun(this.logBaseDir, this.ctx.cwd, job.id, {
+          ts: new Date().toISOString(),
+          outcome: "error",
+          model,
+          requestedModel,
+          durationMs: Date.now() - startedAt,
+          error: result.error.trim() || undefined,
+        });
+        // Failures always count as anomalous for display gating; only an
+        // explicit displayOn="never" hides the error row — wake per
+        // notifyOn still applies independently.
+        const displayEligible = shouldDisplay(job, errorSnippet, true);
+        const wakeEligible = shouldNotify(job, errorSnippet, true);
+        if (displayEligible || wakeEligible) {
+          try {
+            this.pi.sendMessage(
+              {
+                customType: "scheduled_prompt",
+                content: [{ type: "text", text: errorSnippet }],
+                display: displayEligible,
+                details: {
+                  jobId: job.id,
+                  jobName: job.name,
+                  prompt: job.prompt,
+                  mode: "subagent_error",
+                  model,
+                  requestedModel,
+                  error: errorSnippet,
+                },
               },
-            },
-            shouldNotify(job, errorSnippet, true)
-              ? { deliverAs: "followUp", triggerTurn: true }
-              : undefined,
-          );
-        } catch (markerErr) {
-          console.error(`Failed to post subagent_error marker for job ${job.id}:`, markerErr);
+              wakeEligible ? { deliverAs: "followUp", triggerTurn: true } : undefined,
+            );
+          } catch (markerErr) {
+            console.error(`Failed to post subagent_error marker for job ${job.id}:`, markerErr);
+          }
         }
       }
     } catch (error) {

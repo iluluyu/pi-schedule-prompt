@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `displayOn` (`"always" | "anomaly" | "never"`, default `"always"`) — subagent-only chat-display policy, orthogonal to `notifyOn` (wake). With `displayOn: "anomaly"`, healthy runs post **no** markers at all: zero chat rows and zero parent-context growth; anomalies and failures still render and wake, classified from the full untruncated output so an `ALERT` past the snippet boundary is still caught. `displayOn: "never"` suppresses rendering entirely while wake still applies. Auto-applied alongside `notifyOn: "anomaly"` for auto-backgrounded heartbeat-like prompts
+- Bounded on-disk run archive for subagent jobs: every fire appends to `~/.pi/agent/schedule-logs/<cwd-hash>/<jobId>.jsonl` (last 50 runs / 1 MiB per job, 8 KiB per output, best-effort — archive failures never mask run results)
+- `schedule_prompt action="logs"` (`jobId` + optional `tail` 1–50, default 5; without `jobId`, a per-job summary) retrieves archived run outputs
+- `CronJob.lastOutcome` (`ok`/`anomaly`/`error`) persisted per run; widget gains a `⚠` icon for anomalous-but-successful runs and a `~` badge on quiet jobs
+
 ## [0.4.1] - 2026-06-23
 
 ### Added

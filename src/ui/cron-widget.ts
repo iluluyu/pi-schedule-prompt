@@ -142,6 +142,10 @@ export class CronWidget {
         statusIcon = theme.fg("warning", "⟳");
       } else if (job.lastStatus === "error") {
         statusIcon = theme.fg("error", "!");
+      } else if (job.lastOutcome === "anomaly") {
+        // Succeeded but the output matched the anomaly regex — surfaced in
+        // chat when displayOn allows, still flagged here afterwards.
+        statusIcon = theme.fg("warning", "⚠");
       } else {
         statusIcon = theme.fg("success", "✓");
       }
@@ -185,10 +189,13 @@ export class CronWidget {
       const countText = theme.fg("accent", (job.runCount ?? 0).toString().padEnd(3));
 
       // Model badge (only for jobs that run in a subagent).
-      // Trailing "!" marks jobs that wake the parent agent on completion (notify=true).
+      // Trailing "!" marks jobs that wake the parent agent (notify=true);
+      // "~" marks quiet jobs whose healthy runs render nothing (displayOn
+      // anomaly/never) — their outputs live in the run archive instead.
+      const quiet = job.displayOn === "anomaly" || job.displayOn === "never";
       const modelBadge = job.model
         ? " " + theme.fg("accent",
-            `[${job.model.length > 12 ? job.model.substring(0, 9) + "..." : job.model}${job.notify ? "!" : ""}]`)
+            `[${job.model.length > 12 ? job.model.substring(0, 9) + "..." : job.model}${job.notify ? "!" : ""}${quiet ? "~" : ""}]`)
         : "";
 
       // Combine into a row with proper spacing

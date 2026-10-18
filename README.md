@@ -114,7 +114,7 @@ The widget displays below your editor (only when jobs exist):
 
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
-| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` | yes | Operation to perform |
+| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` \| `logs` | yes | Operation to perform |
 | `name` | string | no | Job name (auto-generated if omitted on `add`) |
 | `schedule` | string | on `add` | Cron expression, ISO timestamp, relative time (`+10s`, `+5m`), or interval (`5m`) |
 | `prompt` | string | on `add` | Prompt text to execute when the job fires |
@@ -124,7 +124,9 @@ The widget displays below your editor (only when jobs exist):
 | `model` | non-empty string | no | If set, run the prompt in a fresh in-process agent session instead of injecting it into the current chat. Accepts fuzzy names, `provider/model-id`, or dynamic aliases `current`/`same` (active model) and `fast`/`heartbeat` (small sibling from the active provider). To switch a job back to inline, remove and re-add it without `model` |
 | `notify` | boolean | no | Legacy subagent switch. `true` wakes the parent after every run. For recurring health checks prefer `notifyOn: "anomaly"` |
 | `notifyOn` | `always` \| `never` \| `anomaly` | no | Subagent-only wake policy. `anomaly` wakes only for failures or output containing `HEARTBEAT_ALERT`, `ALERT`, `ERROR`, `FAILED`, `OOM`, `DEAD`, `UNREACHABLE`, or `BLOCKED` |
+| `displayOn` | `always` \| `anomaly` \| `never` | no | Subagent-only chat-display policy, orthogonal to `notifyOn`. `anomaly` renders markers only for failures/anomalous output — healthy runs post **nothing** to the chat or the parent model context (outputs are archived on disk instead, see `action="logs"`). `never` renders no markers at all (wake per `notifyOn` still applies). Default `always` (legacy behavior) |
 | `stopOn` | string | no | Subagent-only literal completion marker. A successful recurring job is disabled immediately when its output contains this marker |
+| `tail` | integer 1–50 | no | `logs` action only. How many archived runs to return, newest first (default 5) |
 | `extensions` | boolean or string[] | no | Subagent-only. If `true`, loads all registered extensions; an array of package names loads only those. Unset or empty array = none (default). Enabling extensions also grants the subagent the full builtin toolset (not just the default read/write/bash set) — required for extension-provided tools to activate. No-op for inline (no-model) jobs |
 | `skills` | boolean or string[] | no | Subagent-only. If `true`, loads all skills; an array of skill names loads only those. Unset or empty array = none (default). No-op for inline (no-model) jobs |
 
@@ -189,7 +191,7 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 **Safety:**
 
 - **Infinite loop prevention**: Blocks scheduled jobs from creating more schedules
-- **Heartbeat isolation**: Explicit recurring heartbeat/GPU/patrol prompts are automatically moved to `model="fast"` + `notifyOn="anomaly"` when no model is supplied
+- **Heartbeat isolation**: Explicit recurring heartbeat/GPU/patrol prompts are automatically moved to `model="fast"` + `notifyOn="anomaly"` + `displayOn="anomaly"` when no model is supplied — fully silent while healthy, archived on disk, rendering and waking only on anomalies
 - **Overlap prevention**: A slow subagent heartbeat cannot start a second copy before the previous tick finishes
 - **Past timestamp detection**: Auto-disables jobs scheduled in the past
 - **Duplicate names**: Prevents name collisions
@@ -202,7 +204,8 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 - Human-readable formatting: "every minute", "daily", "Feb 13 15:30" instead of raw cron/ISO
 - Auto-refreshes every 30 seconds
 - Visibility togglable via `/schedule-prompt → Settings`; persists across sessions (and package upgrades) in `<cwd>/.pi/schedule-prompts-settings.json`, with `~/.pi/agent/schedule-prompts-settings.json` as the global default
-- Status icons: `✓` enabled, `✗` disabled, `⟳` running, `!` error
+- Status icons: `✓` enabled, `✗` disabled, `⟳` running, `!` error, `⚠` last run succeeded but matched the anomaly regex
+- Quiet jobs (`displayOn` `anomaly`/`never`) carry a `~` suffix in their model badge — healthy ticks render nothing and land in the run archive instead
 
 ## Examples
 
@@ -251,12 +254,19 @@ By default a scheduled prompt is injected into your current chat. Set `model` on
   → schedule="+30s", type=once, model="sonnet", prompt="Reply with OK"
 
 "check a long sweep without waking the parent when healthy"
-  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
+  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", displayOn="anomaly", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
 ```
 
 `model` is resolved at fire time. `current`/`same` follows the active parent model; `fast`/`heartbeat` first selects a known small sibling from that provider and otherwise uses a conservative name heuristic. The marker shows both the requested alias and the resolved model.
 
 By default the result is shown in chat but the parent agent is **not** woken up. Use `notifyOn: "anomaly"` for recurring health checks, or `notify: true`/`notifyOn: "always"` for low-frequency workflows. A recurring job with an anomaly policy does not create a parent turn for every healthy tick.
+
+**Quiet mode.** Add `displayOn: "anomaly"` to make healthy runs completely invisible: no `🕐`/`✓` chat rows, no snippet entering the parent model's context — only the widget row keeps tracking the job. Anomalies and failures still render and wake exactly as before, and classification uses the full untruncated output, so an `ALERT` past the 500-character snippet boundary is still caught. Every subagent run (healthy or not) is appended to a bounded on-disk archive — `~/.pi/agent/schedule-logs/<cwd-hash>/<jobId>.jsonl`, last 50 runs / 1 MiB per job, 8 KiB per output — readable on demand:
+
+```
+schedule_prompt action="logs" jobId="abc123" tail=10   → last 10 archived runs, newest first
+schedule_prompt action="logs"                          → per-job summary (runs, last outcome, log path)
+```
 
 Use `stopOn` for lifecycle completion instead of asking the background subagent to call `schedule_prompt`: scheduled subagents intentionally do not load extensions by default, so they cannot reliably remove their own parent job. For example, set `stopOn="DRIVER_DONE"` and make the prompt emit that literal marker only after final verification.
 

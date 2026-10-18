@@ -12,7 +12,17 @@ vi.mock("../src/subagent.js", () => ({
 
 import { runSubagentOnce } from "../src/subagent.js";
 
+// Scheduler tests must not touch the real run archive on disk.
+vi.mock("../src/run-log.js", () => ({
+  archiveRun: vi.fn(),
+  readRuns: vi.fn(() => []),
+  runLogPath: vi.fn(() => ":memory:"),
+}));
+
+import { archiveRun } from "../src/run-log.js";
+
 const mockRunSubagentOnce = vi.mocked(runSubagentOnce);
+const mockArchiveRun = vi.mocked(archiveRun);
 
 // In-memory CronStorage stand-in.
 function makeStorage(seedJobs: CronJob[] = []) {
@@ -732,5 +742,139 @@ describe("CronScheduler — extensions/skills", () => {
 
     const options = mockRunSubagentOnce.mock.calls[0][4];
     expect(options).toEqual({ extensions: false, skills: undefined });
+  });
+});
+
+describe("CronScheduler — displayOn quiet mode", () => {
+  beforeEach(() => {
+    mockRunSubagentOnce.mockReset();
+    mockArchiveRun.mockReset();
+  });
+
+  it("displayOn=anomaly: healthy run posts no markers at all — zero chat rows, zero context", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_OK all good" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    expect(storage.getJob(job.id).runCount).toBe(1);
+    expect(storage.getJob(job.id).lastOutcome).toBe("ok");
+    expect(mockArchiveRun).toHaveBeenCalledTimes(1);
+    expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({
+      outcome: "ok",
+      output: "HEARTBEAT_OK all good",
+    });
+    expect(pi.events.emit).toHaveBeenCalled();
+  });
+
+  it("displayOn=anomaly: anomalous output posts exactly one done marker (no start marker) with wake", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_ALERT GPU OOM" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(1));
+
+    const [msg, opts] = pi.sendMessage.mock.calls[0];
+    expect(msg.details.mode).toBe("subagent_done");
+    expect(msg.display).toBe(true);
+    expect(msg.content[0].text.length).toBeGreaterThan(0);
+    expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(storage.getJob(job.id).lastOutcome).toBe("anomaly");
+    expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({ outcome: "anomaly" });
+  });
+
+  it("displayOn=anomaly: failed run posts the error marker with notify-gated wake", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: false, error: "model exploded" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(1));
+
+    const [msg, opts] = pi.sendMessage.mock.calls[0];
+    expect(msg.details.mode).toBe("subagent_error");
+    expect(msg.display).toBe(true);
+    expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(storage.getJob(job.id).lastOutcome).toBe("error");
+    expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({ outcome: "error", error: "model exploded" });
+  });
+
+  it("displayOn=never + notifyOn=always: one done marker, display:false but still wakes", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "OK" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "always", displayOn: "never" });
+    const scheduler = new CronScheduler(makeStorage([job]), pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(1));
+
+    const [msg, opts] = pi.sendMessage.mock.calls[0];
+    expect(msg.details.mode).toBe("subagent_done");
+    expect(msg.display).toBe(false);
+    // Content stays non-empty even when not rendered — session poisoning guard.
+    expect(msg.content[0].text.length).toBeGreaterThan(0);
+    expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
+  });
+
+  it("classifies anomalies beyond the 500-char snippet boundary (full output)", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "x".repeat(600) + " HEARTBEAT_ALERT" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const scheduler = new CronScheduler(makeStorage([job]), pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(1));
+
+    const [msg, opts] = pi.sendMessage.mock.calls[0];
+    expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    // The displayed snippet is still truncated to 500 chars…
+    expect(msg.details.output).toHaveLength(501);
+  });
+
+  it("stopOn still disables a quiet job when the completion marker is returned", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "DRIVER_DONE" });
+    const pi = makePi();
+    const job = exampleJob({
+      type: "cron",
+      schedule: "0 * * * * *",
+      model: "haiku",
+      notifyOn: "anomaly",
+      displayOn: "anomaly",
+      stopOn: "DRIVER_DONE",
+    });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(storage.getJob(job.id).enabled).toBe(false);
+    expect((scheduler as any).jobs.has(job.id)).toBe(false);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("legacy jobs without displayOn keep the historical start+done markers", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "OK" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly" }); // no displayOn
+    const scheduler = new CronScheduler(makeStorage([job]), pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(2));
+
+    expect(pi.sendMessage.mock.calls[0][0].details.mode).toBe("subagent_start");
+    expect(pi.sendMessage.mock.calls[1][0].details.mode).toBe("subagent_done");
+    expect(pi.sendMessage.mock.calls[1][0].display).toBe(true);
+    expect(pi.sendMessage.mock.calls[1][1]).toBeUndefined(); // anomaly, healthy → no wake
   });
 });

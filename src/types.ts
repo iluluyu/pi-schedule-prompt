@@ -13,6 +13,9 @@ export type CronJobStatus = "success" | "error" | "running";
 /** How a background job wakes its parent session. */
 export type NotifyMode = "always" | "never" | "anomaly";
 
+/** How a background job renders its run markers in the parent chat. */
+export type DisplayMode = "always" | "anomaly" | "never";
+
 /**
  * A scheduled cron job
  */
@@ -49,6 +52,10 @@ export interface CronJob {
   notify?: boolean;
   /** Subagent jobs only. Prefer `anomaly` for recurring health checks to avoid waking the parent when healthy. */
   notifyOn?: NotifyMode;
+  /** Subagent jobs only. Chat-display policy for run markers, orthogonal to `notifyOn` (wake). `anomaly` keeps healthy runs fully silent — no chat rows, no parent-context growth — with outputs archived on disk (see action="logs"). Default `always` (legacy behavior). */
+  displayOn?: DisplayMode;
+  /** Outcome of the last subagent run: healthy, anomalous-but-successful, or failed. */
+  lastOutcome?: "ok" | "anomaly" | "error";
   /** Subagent jobs only. Disable a recurring job after a successful result containing this literal marker. */
   stopOn?: string;
   /** Subagent jobs only. If true, loads all registered extensions. If an array of package names, only those extensions. Default undefined (none). */
@@ -82,7 +89,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup"], {
+  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "logs"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -133,6 +140,19 @@ export const CronToolParams = Type.Object({
     StringEnum(["always", "never", "anomaly"], {
       description:
         "Subagent notification policy: always, never, or anomaly (wake only when output contains HEARTBEAT_ALERT/ALERT/ERROR/FAILED/OOM/DEAD/UNREACHABLE/BLOCKED).",
+    })
+  ),
+  displayOn: Type.Optional(
+    StringEnum(["always", "anomaly", "never"], {
+      description:
+        "Subagent jobs only. Chat-display policy for run markers, orthogonal to notifyOn (wake): always (default), anomaly (healthy runs post nothing to chat or model context; outputs archived on disk, read via action='logs'), or never (no markers rendered; wake per notifyOn still applies).",
+    })
+  ),
+  tail: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 50,
+      description: "Action='logs' only. Number of archived runs to return, newest first (default 5).",
     })
   ),
   stopOn: Type.Optional(

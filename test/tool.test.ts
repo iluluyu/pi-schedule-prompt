@@ -1,4 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { archiveRun } from "../src/run-log.js";
 import { createCronTool } from "../src/tool.js";
 import type { CronJob } from "../src/types.js";
 
@@ -30,6 +34,7 @@ function makeScheduler() {
     removeJob: () => {},
     updateJob: () => {},
     getNextRun: () => null,
+    getRunLogBaseDir: () => "/tmp/pi-schedule-test-logs",
   } as any;
 }
 
@@ -93,6 +98,7 @@ describe("schedule_prompt — notify behavior", () => {
       expect(result.details?.error).toBeUndefined();
       expect(result.details?.jobs?.[0].model).toBe("fast");
       expect(result.details?.jobs?.[0].notifyOn).toBe("anomaly");
+      expect(result.details?.jobs?.[0].displayOn).toBe("anomaly");
     });
 
     it("stores anomaly notification and completion-stop policies", async () => {
@@ -515,5 +521,117 @@ describe("schedule_prompt — extensions/skills", () => {
       expect(result.details?.error).toBeUndefined();
       expect(storage.getJob("j2").skills).toBe(false);
     });
+  });
+});
+
+describe("schedule_prompt — displayOn policy", () => {
+  it("stores an explicit displayOn on add", async () => {
+    const { tool } = buildTool();
+    const result = await tool.execute(
+      "call",
+      {
+        action: "add",
+        schedule: "1h",
+        type: "interval",
+        prompt: "check things",
+        model: "fast",
+        notifyOn: "anomaly",
+        displayOn: "never",
+      } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toBeUndefined();
+    expect(result.details?.jobs?.[0].displayOn).toBe("never");
+  });
+
+  it("updates displayOn in place", async () => {
+    const { tool, storage } = buildTool([exampleJob({ id: "j3", model: "haiku" })]);
+    const result = await tool.execute(
+      "call",
+      { action: "update", jobId: "j3", displayOn: "anomaly" } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toBeUndefined();
+    expect(storage.getJob("j3").displayOn).toBe("anomaly");
+  });
+});
+
+describe("schedule_prompt — logs action", () => {
+  it("returns archived runs newest first", async () => {
+    const logDir = mkdtempSync(join(tmpdir(), "toollogs-"));
+    try {
+      const job = exampleJob({ id: "logjob123", name: "hb", model: "haiku" });
+      const storage = makeStorage([job]);
+      const scheduler = { ...makeScheduler(), getRunLogBaseDir: () => logDir };
+      const tool = createCronTool(() => storage, () => scheduler as any, () => "session");
+
+      archiveRun(logDir, process.cwd(), "logjob123", {
+        ts: "2026-10-18T10:00:00Z",
+        outcome: "ok",
+        output: "HEARTBEAT_OK local 4.7GiB",
+      });
+      archiveRun(logDir, process.cwd(), "logjob123", {
+        ts: "2026-10-18T11:00:00Z",
+        outcome: "anomaly",
+        output: "HEARTBEAT_ALERT swap 3G",
+      });
+
+      const result = await tool.execute(
+        "call",
+        { action: "logs", jobId: "logjob123" } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      const text = (result.content as { type: string; text: string }[])[0].text;
+      expect(result.details?.error).toBeUndefined();
+      expect(text).toContain("HEARTBEAT_ALERT swap 3G");
+      expect(text).toContain("HEARTBEAT_OK local 4.7GiB");
+      expect(text.indexOf("11:00")).toBeLessThan(text.indexOf("10:00")); // newest first
+      expect(text).toContain("logjob123.jsonl");
+    } finally {
+      rmSync(logDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lists per-job summaries when jobId is omitted", async () => {
+    const logDir = mkdtempSync(join(tmpdir(), "toollogs-"));
+    try {
+      const job = exampleJob({ id: "sumjob1234", name: "hb", model: "haiku", runCount: 7 });
+      const storage = makeStorage([job]);
+      const scheduler = { ...makeScheduler(), getRunLogBaseDir: () => logDir };
+      const tool = createCronTool(() => storage, () => scheduler as any, () => "session");
+
+      const result = await tool.execute(
+        "call",
+        { action: "logs" } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      const text = (result.content as { type: string; text }[])[0].text;
+      expect(result.details?.error).toBeUndefined();
+      expect(text).toContain("hb (sumjob1234)");
+      expect(text).toContain("runs=7");
+      expect(text).toContain("never"); // no archive yet → falls back to lastStatus wording
+    } finally {
+      rmSync(logDir, { recursive: true, force: true });
+    }
+  });
+
+  it("errors on an unknown jobId", async () => {
+    const { tool } = buildTool();
+    const result = await tool.execute(
+      "call",
+      { action: "logs", jobId: "nope" } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toContain("Job not found");
   });
 });

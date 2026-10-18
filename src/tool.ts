@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { nanoid } from "nanoid";
+import { readRuns, runLogPath } from "./run-log.js";
 import { CronScheduler } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
 import type { CronStorage } from "./storage.js";
@@ -31,7 +32,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup. For recurring monitoring, set model='fast' or 'current' and notifyOn='anomaly'; explicit heartbeat/GPU/patrol prompts are auto-backgrounded as model='fast' when model is omitted.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, logs (read archived subagent run outputs; needs jobId, optional tail). For quiet recurring monitoring set model='fast' or 'current', notifyOn='anomaly' AND displayOn='anomaly' (auto-applied to heartbeat-like prompts): healthy runs then post nothing to the chat or model context and are archived on disk; anomalies still display and wake the parent.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -118,6 +119,7 @@ export function createCronTool(
               model: params.model ?? (autoBackground ? "fast" : undefined),
               notify: params.notify,
               notifyOn: (params.notifyOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["notifyOn"],
+              displayOn: (params.displayOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["displayOn"],
               stopOn: params.stopOn,
               extensions: params.extensions,
               skills: params.skills,
@@ -131,7 +133,7 @@ export function createCronTool(
             details.jobName = job.name;
 
             const modelLine = job.model
-              ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
+              ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.displayOn ? `, display=${job.displayOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
               : "";
             return {
               content: [
@@ -269,6 +271,7 @@ export function createCronTool(
             if (params.model !== undefined) updates.model = params.model;
             if (params.notify !== undefined) updates.notify = params.notify;
             if (params.notifyOn !== undefined) updates.notifyOn = params.notifyOn as CronJob["notifyOn"];
+            if (params.displayOn !== undefined) updates.displayOn = params.displayOn as CronJob["displayOn"];
             if (params.stopOn !== undefined) updates.stopOn = params.stopOn;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;
@@ -325,7 +328,7 @@ export function createCronTool(
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
               if (job.model) {
-                lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
+                lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.displayOn ? `, display=${job.displayOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
               }
               if (job.stopOn) lines.push(`  Stop on: ${job.stopOn}`);
               lines.push(`  Prompt: ${job.prompt}`);
@@ -336,6 +339,73 @@ export function createCronTool(
               }
               lines.push("");
             }
+
+            return {
+              content: [{ type: "text", text: lines.join("\n") }],
+              details,
+            };
+          }
+
+          case "logs": {
+            const baseDir = scheduler.getRunLogBaseDir();
+            const cwd = ctx.cwd ?? process.cwd();
+            const mySessionId = ctx.sessionManager.getSessionId();
+            const jobs = storage
+              .getAllJobs()
+              .filter((j) => CronScheduler.isLoadedFor(j, mySessionId));
+
+            if (!params.jobId) {
+              if (jobs.length === 0) {
+                return {
+                  content: [{ type: "text", text: "No cron jobs configured." }],
+                  details,
+                };
+              }
+              const lines = ["Run logs per job (re-run with action='logs' and a jobId for full outputs):", ""];
+              for (const job of jobs) {
+                const last = readRuns(baseDir, cwd, job.id, 1)[0];
+                lines.push(
+                  `- ${job.name} (${job.id}) runs=${job.runCount} last=${last ? `${last.ts} ${last.outcome}` : job.lastStatus || "never"} log=${runLogPath(baseDir, cwd, job.id)}`,
+                );
+              }
+              return {
+                content: [{ type: "text", text: lines.join("\n") }],
+                details,
+              };
+            }
+
+            const job = storage.getJob(params.jobId);
+            if (!job) {
+              throw new Error(`Job not found: ${params.jobId}`);
+            }
+            details.jobId = job.id;
+            details.jobName = job.name;
+
+            const tail = Math.min(Math.max(params.tail ?? 5, 1), 50);
+            const runs = readRuns(baseDir, cwd, job.id, tail);
+            if (runs.length === 0) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `No archived runs for job "${job.name}" (${job.id}) yet. Subagent (model) jobs archive every run once they have fired at least once.`,
+                  },
+                ],
+                details,
+              };
+            }
+
+            const lines = [`Archived runs for "${job.name}" (${job.id}) — newest first, showing ${runs.length} of the last ${tail}:`];
+            for (const r of runs) {
+              lines.push("");
+              lines.push(
+                `[${r.ts}] ${r.outcome}${r.durationMs !== undefined ? ` (${(r.durationMs / 1000).toFixed(1)}s)` : ""}${r.model ? ` model=${r.model}` : ""}${r.truncated ? ` output truncated from ${r.originalLength} chars` : ""}`,
+              );
+              if (r.output) lines.push(r.output);
+              if (r.error) lines.push(`error: ${r.error}`);
+            }
+            lines.push("");
+            lines.push(`log file: ${runLogPath(baseDir, cwd, job.id)}`);
 
             return {
               content: [{ type: "text", text: lines.join("\n") }],
@@ -422,6 +492,7 @@ export function createCronTool(
             const subagentTag = job.notify ? "(subagent, notifies parent)" : "(subagent)";
             const tags = [];
             if (job.notifyOn) tags.push(`notify=${job.notifyOn}`);
+            if (job.displayOn) tags.push(`display=${job.displayOn}`);
             if (job.extensions) tags.push("extensions");
             if (job.skills) tags.push("skills");
             const tagStr = tags.length ? ", " + tags.join(" + ") : "";
