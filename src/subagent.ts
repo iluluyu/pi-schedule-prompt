@@ -149,15 +149,33 @@ export function describeAvailableModels(
   return `Available: ${sample}${more}`;
 }
 
-export async function runSubagentOnce(
+/**
+ * A live subagent AgentSession plus the model metadata it was created with.
+ * Intended for reuse across prompts (resident session): create once with
+ * createSubagentSession, then drive each beat with promptSubagentSession.
+ */
+export interface SubagentHandle {
+  session: AgentSession;
+  model: Model<any>;
+  /** Canonical `provider/id` reference of the resolved model. */
+  modelRef: string;
+  /** The raw model string the caller requested (pre-resolution). */
+  requestedModel: string;
+}
+
+/**
+ * Resolve the requested model and spin up a fresh AgentSession for it
+ * (resource loader, session creation, extension binding). Does not prompt.
+ * Returns the live handle on success or an error string on failure.
+ */
+export async function createSubagentSession(
   ctx: ExtensionContext,
-  prompt: string,
   modelStr: string,
-  signal?: AbortSignal,
-  options: RunSubagentOptions = {},
-): Promise<SubagentResult> {
+  currentModel: Model<any> | undefined,
+  options: RunSubagentOptions,
+): Promise<{ ok: true; handle: SubagentHandle } | { ok: false; error: string }> {
   try {
-    const model = resolveModel(ctx.modelRegistry, modelStr, ctx.model);
+    const model = resolveModel(ctx.modelRegistry, modelStr, currentModel);
     if (!model) {
       return {
         ok: false,
@@ -218,39 +236,87 @@ export async function runSubagentOnce(
     if (isEnabled(options.extensions)) {
       await session.bindExtensions({});
     }
-    let onAbort: (() => void) | undefined;
-    if (signal) {
-      if (signal.aborted) {
-        session.abort();
-      } else {
-        onAbort = () => session.abort();
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
+
+    return {
+      ok: true,
+      handle: {
+        session,
+        model,
+        modelRef: modelReference(model),
+        requestedModel: modelStr,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Run one prompt to completion on an (existing) AgentSession and return only
+ * the text streamed during THIS invocation. Resident-session contract: an
+ * empty reply yields {ok:true, text:""} — never a previous beat's answer from
+ * session history. Errors from session.prompt propagate to the caller.
+ */
+export async function promptSubagentSession(
+  session: AgentSession,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<SubagentResult> {
+  let onAbort: (() => void) | undefined;
+  if (signal) {
+    if (signal.aborted) {
+      session.abort();
+    } else {
+      onAbort = () => session.abort();
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  let buffered = "";
+  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "message_start") {
+      buffered = "";
+    } else if (
+      event.type === "message_update" &&
+      event.assistantMessageEvent.type === "text_delta"
+    ) {
+      buffered += event.assistantMessageEvent.delta;
+    }
+  });
+
+  try {
+    await session.prompt(prompt);
+  } finally {
+    unsubscribe();
+    if (signal && onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  return { ok: true, text: buffered.trim() };
+}
+
+export async function runSubagentOnce(
+  ctx: ExtensionContext,
+  prompt: string,
+  modelStr: string,
+  signal?: AbortSignal,
+  options: RunSubagentOptions = {},
+): Promise<SubagentResult> {
+  try {
+    const created = await createSubagentSession(ctx, modelStr, ctx.model, options);
+    if (!created.ok) {
+      return { ok: false, error: created.error };
     }
 
-    let buffered = "";
-    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-      if (event.type === "message_start") {
-        buffered = "";
-      } else if (
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
-        buffered += event.assistantMessageEvent.delta;
-      }
-    });
-
-    try {
-      await session.prompt(prompt);
-    } finally {
-      unsubscribe();
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
+    const { session } = created.handle;
+    const result = await promptSubagentSession(session, prompt, signal);
+    if (result.ok) {
+      // One-shot salvage: if this invocation streamed nothing (no text
+      // deltas), fall back to the session's last assistant message.
+      return { ok: true, text: result.text || getLastAssistantText(session) };
     }
-
-    const text = buffered.trim() || getLastAssistantText(session);
-    return { ok: true, text };
+    return result;
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

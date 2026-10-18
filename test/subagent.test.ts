@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createSubagentSession,
   describeAvailableModels,
   getLastAssistantText,
+  promptSubagentSession,
   resolveModel,
   runSubagentOnce,
 } from "../src/subagent.js";
@@ -205,34 +207,36 @@ describe("getLastAssistantText", () => {
   });
 });
 
+// Minimal fake AgentSession shared by the runSubagentOnce / createSubagentSession /
+// promptSubagentSession tests — only the fields the code under test touches.
+function makeFakeSession() {
+  return {
+    abort: vi.fn(),
+    subscribe: vi.fn(() => vi.fn()),
+    prompt: vi.fn().mockResolvedValue(undefined),
+    messages: [] as any[],
+    bindExtensions: vi.fn(),
+  };
+}
+
+function makeCtx() {
+  return {
+    cwd: "/tmp",
+    modelRegistry: {
+      find: () => MODELS[0],
+      getAvailable: () => MODELS,
+    },
+    sessionManager: {
+      getSessionId: () => "test",
+    },
+  } as any;
+}
+
 describe("runSubagentOnce", () => {
   beforeEach(() => {
     mockCreateAgentSession.mockReset();
     mockDefaultResourceLoader.mockReset();
   });
-
-  function makeFakeSession() {
-    return {
-      abort: vi.fn(),
-      subscribe: vi.fn(() => vi.fn()),
-      prompt: vi.fn().mockResolvedValue(undefined),
-      messages: [],
-      bindExtensions: vi.fn(),
-    };
-  }
-
-  function makeCtx() {
-    return {
-      cwd: "/tmp",
-      modelRegistry: {
-        find: () => MODELS[0],
-        getAvailable: () => MODELS,
-      },
-      sessionManager: {
-        getSessionId: () => "test",
-      },
-    } as any;
-  }
 
   it("default: creates subagent with noExtensions=true, noSkills=true, tools=DEFAULT_TOOL_NAMES, no bindExtensions", async () => {
     const fakeSession = makeFakeSession();
@@ -413,5 +417,119 @@ describe("runSubagentOnce", () => {
     expect(sessionOptions.tools).toEqual(["bash", "read", "edit", "write", "grep", "find", "ls"]);
 
     expect(fakeSession.bindExtensions).not.toHaveBeenCalled();
+  });
+});
+
+describe("createSubagentSession", () => {
+  beforeEach(() => {
+    mockCreateAgentSession.mockReset();
+    mockDefaultResourceLoader.mockReset();
+  });
+
+  it("unknown model: returns ok:false with the Unknown-model error and never creates a session", async () => {
+    const result = await createSubagentSession(
+      makeCtx(),
+      "definitely-not-a-real-model",
+      undefined,
+      {},
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return; // narrow for TS
+    expect(result.error).toContain("Unknown model 'definitely-not-a-real-model'");
+    expect(result.error).toContain("Available:");
+    // Failed resolution must short-circuit before any session machinery runs.
+    expect(mockDefaultResourceLoader).not.toHaveBeenCalled();
+    expect(mockCreateAgentSession).not.toHaveBeenCalled();
+  });
+
+  it("success: returns a handle with the live session, resolved model, modelRef and requestedModel", async () => {
+    const fakeSession = makeFakeSession();
+    mockCreateAgentSession.mockResolvedValue({ session: fakeSession });
+
+    const result = await createSubagentSession(makeCtx(), MODELS[0].id, undefined, {});
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.handle.session).toBe(fakeSession);
+    expect(result.handle.model).toEqual(MODELS[0]);
+    expect(result.handle.modelRef).toBe("anthropic/claude-opus-4-6");
+    expect(result.handle.requestedModel).toBe(MODELS[0].id);
+    // The resolved model is what the session is created with.
+    expect(mockCreateAgentSession.mock.calls[0][0].model).toEqual(MODELS[0]);
+  });
+
+  it("prompt errors bubble as ok:false with the error message", async () => {
+    // createAgentSession rejection must surface as an error string, not throw.
+    mockCreateAgentSession.mockRejectedValue(new Error("boom"));
+
+    const result = await createSubagentSession(makeCtx(), MODELS[0].id, undefined, {});
+
+    expect(result).toEqual({ ok: false, error: "boom" });
+  });
+});
+
+describe("promptSubagentSession", () => {
+  // Fake session whose subscribe handler is captured so a test can stream
+  // events into it, plus a stale assistant message in history — if the
+  // implementation wrongly fell back to getLastAssistantText, that stale
+  // text would leak into the result.
+  function makeStreamSession(staleText = "stale answer from a previous beat") {
+    let handler: ((event: any) => void) | undefined;
+    const unsubscribe = vi.fn();
+    const session = {
+      abort: vi.fn(),
+      subscribe: vi.fn((h: (event: any) => void) => {
+        handler = h;
+        return unsubscribe;
+      }),
+      prompt: vi.fn().mockResolvedValue(undefined),
+      messages: [{ role: "assistant", content: staleText }],
+      bindExtensions: vi.fn(),
+    };
+    return {
+      session,
+      unsubscribe,
+      emit: (event: any) => handler?.(event),
+    };
+  }
+
+  it("empty reply: returns {ok:true, text:''} — never falls back to stale session history", async () => {
+    const { session, unsubscribe } = makeStreamSession();
+
+    const result = await promptSubagentSession(session as any, "beat");
+
+    expect(result).toEqual({ ok: true, text: "" });
+    expect(session.prompt).toHaveBeenCalledWith("beat");
+    // Request-scoped subscription is torn down after the prompt resolves.
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("streams only this invocation's deltas: a later empty beat returns empty text, not the previous beat's answer", async () => {
+    const { session, emit } = makeStreamSession();
+
+    // Beat 1: the model streams text deltas during session.prompt.
+    session.prompt.mockImplementation(async () => {
+      emit({ type: "message_start" });
+      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "beat one " } });
+      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer" } });
+    });
+    const first = await promptSubagentSession(session as any, "beat 1");
+    expect(first).toEqual({ ok: true, text: "beat one answer" });
+
+    // Beat 2 on the same resident session: nothing streams → empty text.
+    session.prompt.mockResolvedValue(undefined);
+    const second = await promptSubagentSession(session as any, "beat 2");
+    expect(second).toEqual({ ok: true, text: "" });
+  });
+
+  it("aborts the session immediately when the signal is already aborted", async () => {
+    const { session } = makeStreamSession();
+    const controller = new AbortController();
+    controller.abort();
+
+    await promptSubagentSession(session as any, "beat", controller.signal);
+
+    expect(session.abort).toHaveBeenCalledTimes(1);
   });
 });
