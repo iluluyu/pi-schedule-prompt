@@ -220,11 +220,15 @@ export class CronWidget {
       const gaps = parts.length - 1;
       const natural = visibleWidth(prefix) + parts.reduce((sum, p) => sum + visibleWidth(p), 0);
       const slack = Math.max(0, width - natural - sepWidth * gaps);
+      // Cap per-gap padding: full justification looks broken with few long
+      // entries (one giant hole in the middle); 8 extra columns still reads
+      // as evenly spread with 3+ jobs.
+      const extra = Math.min(8, Math.floor(slack / gaps));
       const segments: string[] = [prefix];
       for (let i = 0; i < parts.length; i++) {
         segments.push(parts[i]);
         if (i < gaps) {
-          const gapWidth = 3 + Math.floor(slack / gaps) + (i < slack % gaps ? 1 : 0);
+          const gapWidth = 3 + extra + (i < slack - extra * gaps ? 1 : 0);
           const left = Math.floor((gapWidth - 1) / 2);
           segments.push(`${" ".repeat(left)}·${" ".repeat(gapWidth - 1 - left)}`);
         }
@@ -238,9 +242,52 @@ export class CronWidget {
     return [truncateToWidth(line, width, "")];
   }
 
-  /** One compact entry compressed to `share` columns: identity (icon+name)
-   *  survives longest, then the progress detail; the next-run tail is the
-   *  first thing dropped under pressure. */
+  /** The meter segment (progress bar + total) for a job, or null when the
+   *  period is unknown. Shared by the natural and compressed entry forms. */
+  private meterFor(job: CronJob, theme: any): string | null {
+    const nextRun = this.scheduler.getNextRun(job.id);
+    const period = this.scheduler.getBeatPeriodMs?.(job.id) ?? null;
+    const lastMs = job.lastRun ? new Date(job.lastRun).getTime() : null;
+    if (period && lastMs) {
+      // Progress form: 5-cell filled/hollow squares over the beat period
+      // (resets each fire) + the total, e.g. "▪▪▫▫▫ 30s".
+      const elapsed = Math.max(0, Date.now() - lastMs);
+      return `${progressBar(elapsed, period, theme)} ${compactToken(period)}`;
+    }
+    if (period && nextRun) {
+      // Before the first beat (no lastRun yet): derive elapsed from the
+      // countdown — the bar starts filling from job creation instead of
+      // showing a bare remaining/total countdown.
+      const remaining = Math.max(0, nextRun.getTime() - Date.now());
+      const elapsed = Math.max(0, Math.min(period, period - remaining));
+      return `${progressBar(elapsed, period, theme)} ${compactToken(period)}`;
+    }
+    return null;
+  }
+
+  /** One compact entry: `icon name` + dim status line (or humanized
+   *  schedule) + meter. */
+  private compactEntry(job: CronJob, theme: any): string {
+    const icon = statusIconFor(job, theme);
+    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
+    const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
+    const detail = theme.fg("dim", detailRaw);
+    const parts = [`${icon} ${name}`, detail];
+    const meter = this.meterFor(job, theme);
+    if (meter) {
+      parts.push(meter);
+    } else {
+      const nextRun = this.scheduler.getNextRun(job.id);
+      if (nextRun) parts.push(formatRelativeTime(nextRun));
+    }
+    return parts.join(" ");
+  }
+
+  /** One compact entry compressed to `share` columns. Compression priority:
+   *  identity (icon+name) survives longest, then the METER (dropping it is
+   *  what users notice — the status text yields first, then truncates),
+   *  and only a share too small for head+meter together truncates the
+   *  whole entry. */
   private compactEntryFit(job: CronJob, theme: any, share: number): string {
     const full = this.compactEntry(job, theme);
     if (visibleWidth(full) <= share) return full;
@@ -249,41 +296,24 @@ export class CronWidget {
     const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
     const head = `${icon} ${name}`;
     const headWidth = visibleWidth(head);
-    if (headWidth + 1 >= share) {
+    const meter = this.meterFor(job, theme) ?? this.fallbackTailFor(job);
+    const meterWidth = meter ? visibleWidth(meter) + 1 : 0;
+
+    if (headWidth + meterWidth + 1 >= share) {
+      // Even head + meter barely fit: fall back to truncating the whole
+      // natural entry rather than dropping the meter.
       return truncateToWidth(full, Math.max(1, share), "…");
     }
     const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
-    const room = share - headWidth - 1;
-    return `${head} ${theme.fg("dim", truncateToWidth(detailRaw, room, "…"))}`;
+    const room = share - headWidth - meterWidth - 1;
+    const detail = room > 0 ? theme.fg("dim", truncateToWidth(detailRaw, room, "…")) : "";
+    return [head, detail, meter].filter(Boolean).join(" ");
   }
 
-  /** One compact entry: `icon name` + dim status line (or humanized schedule)
-   *  + relative next run. */
-  private compactEntry(job: CronJob, theme: any): string {
-    const icon = statusIconFor(job, theme);
-    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
-    const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
-    const detail = theme.fg("dim", detailRaw);
+  /** Period-unknown fallback tail (plain countdown) for compression. */
+  private fallbackTailFor(job: CronJob): string | null {
     const nextRun = this.scheduler.getNextRun(job.id);
-    const period = this.scheduler.getBeatPeriodMs?.(job.id) ?? null;
-    const lastMs = job.lastRun ? new Date(job.lastRun).getTime() : null;
-    const parts = [`${icon} ${name}`, detail];
-    if (period && lastMs) {
-      // Progress form: 5-cell filled/hollow squares over the beat period
-      // (resets each fire) + the total, e.g. "▪▪▫▫▫ 30s".
-      const elapsed = Math.max(0, Date.now() - lastMs);
-      parts.push(`${progressBar(elapsed, period, theme)} ${compactToken(period)}`);
-    } else if (period && nextRun) {
-      // Before the first beat (no lastRun yet): derive elapsed from the
-      // countdown — the bar starts filling from job creation instead of
-      // showing a bare remaining/total countdown.
-      const remaining = Math.max(0, nextRun.getTime() - Date.now());
-      const elapsed = Math.max(0, Math.min(period, period - remaining));
-      parts.push(`${progressBar(elapsed, period, theme)} ${compactToken(period)}`);
-    } else if (nextRun) {
-      parts.push(formatRelativeTime(nextRun));
-    }
-    return parts.join(" ");
+    return nextRun ? formatRelativeTime(nextRun) : null;
   }
 
   /**

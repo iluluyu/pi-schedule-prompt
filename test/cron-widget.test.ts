@@ -234,16 +234,37 @@ describe("CronWidget — compact style", () => {
     expect(line).not.toMatch(/\+\d+$/);
   });
 
-  it("justifies entries to occupy the full available width", () => {
+  it("spreads slack into the separator, capped at 8 extra columns per gap", () => {
     const a = exampleJob({ id: "1", name: "one", lastStatusLine: "s1" });
     const b = exampleJob({ id: "2", name: "two", lastStatusLine: "s2" });
+    // Saturated render (huge slack -> gap = 3 + 8 cap).
+    const saturated = visibleWidth(renderCompact([a, b], { width: 400 })[0]);
+    expect(saturated).toBeLessThan(400);
     const lines = renderCompact([a, b], { width: 120 });
     expect(lines).toHaveLength(1);
-    // Slack is spread into the separator: the line spans the full width.
-    expect(visibleWidth(lines[0])).toBe(120);
+    expect(visibleWidth(lines[0])).toBe(saturated); // slack still exceeds the cap
     expect(lines[0]).toContain("one");
     expect(lines[0]).toContain("two");
     expect(lines[0]).toContain("·");
+  });
+
+  it("compresses the status text, never the meter, under width pressure", () => {
+    const long = exampleJob({
+      id: "1",
+      name: "watcher",
+      lastStatusLine: "x".repeat(80),
+      intervalMs: 30000,
+      lastRun: new Date().toISOString(),
+    });
+    const other = exampleJob({ id: "2", name: "other", lastStatusLine: "ok" });
+    const lines = renderCompact([long, other], { width: 80, periodMs: 30000 });
+    const line = lines[0];
+    expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+    // The meter survives; the long detail is the part that truncated.
+    expect((line.match(/▪|▫/g) ?? []).length).toBeGreaterThanOrEqual(5);
+    expect(line).toContain("30s");
+    expect(line).toContain("…");
+    expect(line).not.toContain("x".repeat(20));
   });
 
   it("renders a progress bar + total period between beats", () => {
