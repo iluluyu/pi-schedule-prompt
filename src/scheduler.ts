@@ -29,7 +29,15 @@ function snippet(text: string): string {
     : text;
 }
 
-const ANOMALY_OUTPUT = /\b(?:HEARTBEAT_ALERT|ALERT|CRITICAL|ERROR|FAILED|OOM|DEAD|UNREACHABLE|BLOCKED)\b/i;
+// Negation-guarded: prose like "no ERROR observed" or "did not fail" must not
+// count as an anomaly — only affirmative mentions do.
+const ANOMALY_OUTPUT =
+  /(?<!\bno\s+)(?<!\bnot\s+)(?<!\bwithout\s+)(?<!\bnever\s+)\b(?:HEARTBEAT_ALERT|ALERT|CRITICAL|ERROR|FAILED|OOM|DEAD|UNREACHABLE|BLOCKED)\b/i;
+
+/** Escape a literal string for embedding in a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function shouldNotify(job: CronJob, output: string, failed: boolean): boolean {
   if (job.notifyOn === "never") return false;
@@ -367,7 +375,9 @@ export class CronScheduler {
     if (!fresh?.enabled) return;
     if (!CronScheduler.isLoadedFor(fresh, this.ctx.sessionManager.getSessionId())) return;
 
-    console.log(`Executing scheduled prompt: ${fresh.name} (${fresh.id})`);
+    if (!fresh.model) {
+      console.log(`Executing scheduled prompt: ${fresh.name} (${fresh.id})`);
+    }
 
     if (fresh.model) {
       // A slow health check must not overlap with the next interval. Overlap
@@ -671,7 +681,11 @@ export class CronScheduler {
       if (result.ok) {
         const rawOutput = result.text.trim();
         const outputSnippet = snippet(rawOutput) || "(subagent produced no text output)";
-        const stopRequested = Boolean(job.stopOn && rawOutput.includes(job.stopOn));
+        // Whole-line marker match only: an agent *mentioning* the stop token
+        // in prose ("E2E_STOP not observed") must not terminate the job.
+        const stopRequested = Boolean(
+          job.stopOn && new RegExp(`^\\s*${escapeRegExp(job.stopOn)}\\s*$`, "m").test(rawOutput),
+        );
         const anomalous = isAnomalyOutput(rawOutput);
         const statusLine = extractStatusLine(rawOutput);
         // Re-read runCount from storage; `job` here is the closure-captured

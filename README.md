@@ -258,7 +258,7 @@ By default a scheduled prompt is injected into your current chat. Set `model` on
   → schedule="+30s", type=once, model="sonnet", prompt="Reply with OK"
 
 "check a long sweep without waking the parent when healthy"
-  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", displayOn="anomaly", resident=true, contextNote="arms: ls_herr/ls_cerr/sg; alert if GPU>11GiB local / >15GiB remote", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
+  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", displayOn="anomaly", resident=true, contextNote="monitored arms: A/B/C on two hosts; alert if GPU>11GiB local / >15GiB remote", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
 ```
 
 `model` is resolved at fire time. `current`/`same` follows the active parent model; `fast`/`heartbeat` first selects a known small sibling from that provider and otherwise uses a conservative name heuristic. The marker shows both the requested alias and the resolved model.

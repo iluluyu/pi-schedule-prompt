@@ -867,6 +867,40 @@ describe("CronScheduler — displayOn quiet mode", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("stopOn requires a whole-line marker — prose mentions do not stop the job", async () => {
+    mockRunSubagentOnce.mockResolvedValue({
+      ok: true,
+      text: "HEARTBEAT_OK\n- Stop token DRIVER_DONE not observed; continuing.",
+    });
+    const job = exampleJob({
+      type: "cron",
+      schedule: "0 * * * * *",
+      model: "haiku",
+      stopOn: "DRIVER_DONE",
+    });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(storage.getJob(job.id).enabled).toBe(true);
+  });
+
+  it("negated anomaly mentions (\"no ERROR observed\") do not count as anomalies", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "STATUS: ok\nno ERROR observed, not failed" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(storage.getJob(job.id).lastOutcome).toBe("ok");
+    expect(pi.sendMessage).not.toHaveBeenCalled(); // healthy → fully quiet
+  });
+
   it("legacy jobs without displayOn keep the historical start+done markers", async () => {
     mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "OK" });
     const pi = makePi();
