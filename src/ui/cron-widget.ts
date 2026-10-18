@@ -179,19 +179,42 @@ export class CronWidget {
    *  entries — highest urgency first — share the width EQUALLY; each entry
    *  compresses internally (identity > progress > next-run) instead of whole
    *  jobs being dropped, and overflow beyond the cap is simply not shown
-   *  (the table style remains the full view). */
+   *  (the table style remains the full view). When the natural content is
+   *  narrower than the available width, the slack is justified evenly into
+   *  the separators so the line spans the full screen width. */
   private renderCompact(width: number, theme: any): string[] {
     const jobs = this.uniqueJobs().slice().sort((a, b) => compactRank(a) - compactRank(b));
     const prefix = `${theme.fg("error", "♥")} `;
-    const separator = " · ";
-    const sepWidth = visibleWidth(separator);
+    const baseSeparator = " · ";
+    const sepWidth = visibleWidth(baseSeparator);
 
     const shown = jobs.slice(0, Math.min(jobs.length, MAX_COMPACT_JOBS));
     const usable = Math.max(0, width - visibleWidth(prefix) - sepWidth * Math.max(0, shown.length - 1));
     const share = shown.length > 0 ? Math.floor(usable / shown.length) : usable;
 
     const parts = shown.map((job) => this.compactEntryFit(job, theme, Math.max(1, share)));
-    const line = prefix + parts.join(separator);
+
+    // Full-width justification: when the natural entries leave slack, spread
+    // it evenly across the separators (first gaps absorb the remainder) so
+    // the line occupies the whole available width instead of ending early.
+    let line: string;
+    if (parts.length > 1) {
+      const gaps = parts.length - 1;
+      const natural = visibleWidth(prefix) + parts.reduce((sum, p) => sum + visibleWidth(p), 0);
+      const slack = Math.max(0, width - natural - sepWidth * gaps);
+      const segments: string[] = [prefix];
+      for (let i = 0; i < parts.length; i++) {
+        segments.push(parts[i]);
+        if (i < gaps) {
+          const gapWidth = 3 + Math.floor(slack / gaps) + (i < slack % gaps ? 1 : 0);
+          const left = Math.floor((gapWidth - 1) / 2);
+          segments.push(`${" ".repeat(left)}·${" ".repeat(gapWidth - 1 - left)}`);
+        }
+      }
+      line = segments.join("");
+    } else {
+      line = prefix + (parts[0] ?? "");
+    }
 
     // Final width safety (e.g. degenerate widths smaller than the prefix).
     return [truncateToWidth(line, width, "")];

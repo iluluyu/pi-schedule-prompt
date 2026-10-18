@@ -227,6 +227,18 @@ describe("CronWidget — compact style", () => {
     expect(line).not.toMatch(/\+\d+$/);
   });
 
+  it("justifies entries to occupy the full available width", () => {
+    const a = exampleJob({ id: "1", name: "one", lastStatusLine: "s1" });
+    const b = exampleJob({ id: "2", name: "two", lastStatusLine: "s2" });
+    const lines = renderCompact([a, b], { width: 120 });
+    expect(lines).toHaveLength(1);
+    // Slack is spread into the separator: the line spans the full width.
+    expect(visibleWidth(lines[0])).toBe(120);
+    expect(lines[0]).toContain("one");
+    expect(lines[0]).toContain("two");
+    expect(lines[0]).toContain("·");
+  });
+
   it("caps the compact line at 5 jobs — overflow is hidden, not shown", () => {
     const mk = (id: string, name: string) => exampleJob({ id, name, lastStatusLine: "ok" });
     const jobs = [mk("1", "j-one"), mk("2", "j-two"), mk("3", "j-three"), mk("4", "j-four"), mk("5", "j-five"), mk("6", "j-six"), mk("7", "j-seven")];
