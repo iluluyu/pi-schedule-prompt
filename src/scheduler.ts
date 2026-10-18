@@ -109,7 +109,9 @@ function buildParentDigest(entries: unknown[], maxChars = 8000): string {
     const entry = e as { type?: string; message?: { role?: string; content?: unknown } };
     if (entry?.type !== "message" || !entry.message) continue;
     const role = entry.message.role ?? "user";
-    if (role === "system") continue;
+    // Text dialogue only — tool payloads and system boilerplate would bloat
+    // the seed and leak unrelated content into the child session.
+    if (role === "system" || role === "toolResult") continue;
     let text = "";
     const content = entry.message.content;
     if (typeof content === "string") {

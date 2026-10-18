@@ -1100,6 +1100,27 @@ describe("CronScheduler — resident sessions, status lines, alert suppression",
     expect((scheduler as any).residentSessions.size).toBe(0);
   });
 
+  it("buildParentDigest-equivalent filtering: toolResult roles are excluded from the seed", async () => {
+    const ctx = makeCtx();
+    (ctx.sessionManager as any).getEntries = () => [
+      { type: "message", message: { role: "user", content: "run the sweep" } },
+      { type: "message", message: { role: "toolResult", content: "huge tool payload 12345" } },
+      { type: "message", message: { role: "assistant", content: [{ type: "text", text: "sweep started" }] } },
+    ];
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "STATUS: ok" });
+    const job = residentJob();
+    const scheduler = new CronScheduler(makeStorage([job]), makePi(), ctx);
+
+    await (scheduler as any).executeJobInSubagent(job);
+
+    const seed = mockPromptSubagentSession.mock.calls[0][1] as string;
+    expect(seed).toContain("run the sweep");
+    expect(seed).toContain("sweep started");
+    expect(seed).not.toContain("huge tool payload");
+  });
+
   it("residentTranscript returns the live dialogue; errors guide non-resident jobs to logs", async () => {
     const session = {
       abort: vi.fn(),
