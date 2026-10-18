@@ -745,7 +745,9 @@ export class CronScheduler {
               prompt: `${job.prompt}${STATUS_CONVENTION}${this.recentBeatsMemory(job)}`,
               name: handle || "hb",
               description: `heartbeat: ${job.name}`,
-              model: requestedModel,
+              // Pass the canonical provider/id — the RPC host does not know
+              // this plugin's `fast`/`current` aliases.
+              model,
               isBackground: true,
             },
             BEAT_TIMEOUT_MS,

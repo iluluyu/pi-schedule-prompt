@@ -1188,6 +1188,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
   function makeRpcPi(opts: { agentId?: string; result?: string; fail?: boolean } = {}) {
     const agentId = opts.agentId ?? "agent-1";
     const handlers = new Map<string, ((data: any) => void)[]>();
+    const spawnRequests: any[] = [];
     const dispatch = (event: string, data: any) => {
       for (const h of handlers.get(event) ?? []) h(data);
     };
@@ -1211,6 +1212,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
             return;
           }
           if (event === "subagents:rpc:spawn") {
+            spawnRequests.push(data);
             queueMicrotask(() => {
               dispatch(`${event}:reply:${data.requestId}`, { success: true, data: agentId });
               setTimeout(() => {
@@ -1226,6 +1228,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
           dispatch(event, data);
         },
       },
+      spawnRequests,
     } as any;
   }
 
@@ -1239,6 +1242,9 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
     await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
 
     expect(mockRunSubagentOnce).not.toHaveBeenCalled();
+    // The RPC host must receive the canonical model reference, not an alias.
+    expect(pi.spawnRequests[0]?.options?.model).toBe("haiku");
+    expect(pi.spawnRequests[0]?.prompt).toContain("STATUS:");
     expect(storage.getJob(job.id).lastOutcome).toBe("ok");
     expect(storage.getJob(job.id).lastStatusLine).toBe("rpc ok");
     expect(mockArchiveRun).toHaveBeenCalledTimes(1);
