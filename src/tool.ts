@@ -105,6 +105,11 @@ export function createCronTool(
               description: params.description,
               prompt: params.prompt,
             });
+            if (params.resident && !(params.model ?? autoBackground)) {
+              throw new Error(
+                "'resident' requires 'model' — resident sessions run in a subagent. Add a model (e.g. 'fast') or drop resident.",
+              );
+            }
             const job: CronJob = {
               id: nanoid(10),
               name: jobName,
@@ -120,6 +125,8 @@ export function createCronTool(
               notify: params.notify,
               notifyOn: (params.notifyOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["notifyOn"],
               displayOn: (params.displayOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["displayOn"],
+              resident: params.resident,
+              contextNote: params.contextNote?.slice(0, 4000),
               stopOn: params.stopOn,
               extensions: params.extensions,
               skills: params.skills,
@@ -272,6 +279,13 @@ export function createCronTool(
             if (params.notify !== undefined) updates.notify = params.notify;
             if (params.notifyOn !== undefined) updates.notifyOn = params.notifyOn as CronJob["notifyOn"];
             if (params.displayOn !== undefined) updates.displayOn = params.displayOn as CronJob["displayOn"];
+            if (params.resident !== undefined) updates.resident = params.resident;
+            if (params.contextNote !== undefined) updates.contextNote = params.contextNote.slice(0, 4000);
+            if ((updates.resident ?? job.resident) && !(updates.model ?? job.model)) {
+              throw new Error(
+                "'resident' requires 'model' — set a model on the job before enabling resident mode.",
+              );
+            }
             if (params.stopOn !== undefined) updates.stopOn = params.stopOn;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;
@@ -409,6 +423,31 @@ export function createCronTool(
 
             return {
               content: [{ type: "text", text: lines.join("\n") }],
+              details,
+            };
+          }
+
+          case "ask": {
+            if (!params.jobId || !params.question) {
+              throw new Error("action='ask' requires both jobId and question.");
+            }
+            const job = storage.getJob(params.jobId);
+            if (!job) {
+              throw new Error(`Job not found: ${params.jobId}`);
+            }
+            details.jobId = job.id;
+            details.jobName = job.name;
+
+            const answer = await scheduler.askResident(params.jobId, params.question);
+            if (!answer.ok) {
+              details.error = answer.error;
+              return {
+                content: [{ type: "text", text: `✗ ${answer.error}` }],
+                details,
+              };
+            }
+            return {
+              content: [{ type: "text", text: answer.text || "(no output)" }],
               details,
             };
           }

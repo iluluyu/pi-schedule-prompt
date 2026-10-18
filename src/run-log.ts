@@ -23,6 +23,8 @@ export type RunOutcome = "ok" | "anomaly" | "error";
 export interface RunLogEntry {
   ts: string;
   outcome: RunOutcome;
+  /** What produced this entry: a scheduled beat (default) or an ad-hoc ask. */
+  kind?: "beat" | "ask";
   model?: string;
   requestedModel?: string;
   durationMs?: number;

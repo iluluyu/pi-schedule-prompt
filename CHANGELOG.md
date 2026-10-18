@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded on-disk run archive for subagent jobs: every fire appends to `~/.pi/agent/schedule-logs/<cwd-hash>/<jobId>.jsonl` (last 50 runs / 1 MiB per job, 8 KiB per output, best-effort — archive failures never mask run results)
 - `schedule_prompt action="logs"` (`jobId` + optional `tail` 1–50, default 5; without `jobId`, a per-job summary) retrieves archived run outputs
 - `CronJob.lastOutcome` (`ok`/`anomaly`/`error`) persisted per run; widget gains a `⚠` icon for anomalous-but-successful runs and a `~` badge on quiet jobs
+- **Resident heartbeat agents**: `resident: true` (requires `model`) keeps one agent session alive across beats — trend memory, seeded once with a bounded text-only parent-session digest plus a `contextNote` briefing; model pinned at creation; auto-reset with a handoff summary at ~120k transcript chars; disposed on removal/config change/shutdown
+- **`action="ask"`** (`jobId` + `question`): ad-hoc dialogue with a resident job's session — the main agent can interrogate the heartbeat agent; inspection-only (archives `kind:"ask"`, no counters/stopOn/notifications); shared busy guard with beats returns a retryable error
+- **`STATUS:` progress convention**: beat prompts ask for a first-line `STATUS: <summary>`; the scheduler extracts it (first non-empty line only, terminal escapes stripped, 240-char cap) and persists `lastStatusLine`/`lastStatusLineAt` for the compact widget
+- **Compact widget** (new default `widgetStyle`): one borderless progress line below the editor rendering `lastStatusLine` per job, anomalous/error/running jobs first, width-aware truncation with `+N` overflow; `table` keeps the classic view, `hidden` disables; legacy `widgetVisible:false` migrates to `hidden`; cycled from `/schedule-prompt → Settings → Widget style`
+- **Alert wake suppression + recovery**: with `notifyOn:"anomaly"`, a persistent anomaly re-wakes the parent only every 4th consecutive beat; a display-only recovery marker fires when the job returns to healthy
 
 ## [0.4.1] - 2026-06-23
 

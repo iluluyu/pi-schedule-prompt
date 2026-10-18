@@ -54,8 +54,18 @@ export interface CronJob {
   notifyOn?: NotifyMode;
   /** Subagent jobs only. Chat-display policy for run markers, orthogonal to `notifyOn` (wake). `anomaly` keeps healthy runs fully silent — no chat rows, no parent-context growth — with outputs archived on disk (see action="logs"). Default `always` (legacy behavior). */
   displayOn?: DisplayMode;
+  /** Subagent jobs only. Keep one agent session alive across fires instead of a fresh session per tick — gives the heartbeat trend memory — and allow ad-hoc `action="ask"` interrogation. Requires `model`. */
+  resident?: boolean;
+  /** Optional briefing embedded once when a resident session is created (or re-seeded after a reset). */
+  contextNote?: string;
   /** Outcome of the last subagent run: healthy, anomalous-but-successful, or failed. */
   lastOutcome?: "ok" | "anomaly" | "error";
+  /** Last `STATUS:` line extracted from a subagent run's output (progress convention, see README). */
+  lastStatusLine?: string;
+  /** When `lastStatusLine` was captured — staleness signal for the compact widget. */
+  lastStatusLineAt?: string;
+  /** Consecutive anomalous-but-successful runs; drives wake suppression so a persistent anomaly does not wake the parent every tick. */
+  lastAlertStreak?: number;
   /** Subagent jobs only. Disable a recurring job after a successful result containing this literal marker. */
   stopOn?: string;
   /** Subagent jobs only. If true, loads all registered extensions. If an array of package names, only those extensions. Default undefined (none). */
@@ -89,7 +99,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "logs"], {
+  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "logs", "ask"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -146,6 +156,24 @@ export const CronToolParams = Type.Object({
     StringEnum(["always", "anomaly", "never"], {
       description:
         "Subagent jobs only. Chat-display policy for run markers, orthogonal to notifyOn (wake): always (default), anomaly (healthy runs post nothing to chat or model context; outputs archived on disk, read via action='logs'), or never (no markers rendered; wake per notifyOn still applies).",
+    })
+  ),
+  resident: Type.Optional(
+    Type.Boolean({
+      description:
+        "Subagent jobs only (requires model). Keep one agent session alive across fires — the heartbeat remembers previous beats and trends — and enable action='ask' to interrogate it ad hoc. The session resets automatically when its transcript grows too large, carrying a handoff summary.",
+    })
+  ),
+  contextNote: Type.Optional(
+    Type.String({
+      description:
+        "Subagent jobs only. Briefing text embedded once when a resident session is created: background the heartbeat agent should always know (experiment layout, what the arms mean, alert thresholds). Bounded to ~4k chars.",
+    })
+  ),
+  question: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description: "action='ask' only. Ad-hoc question sent into a resident job's session; its full answer is returned. The job must have resident=true.",
     })
   ),
   tail: Type.Optional(

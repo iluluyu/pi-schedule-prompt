@@ -114,7 +114,7 @@ The widget displays below your editor (only when jobs exist):
 
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
-| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` \| `logs` | yes | Operation to perform |
+| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` \| `logs` \| `ask` | yes | Operation to perform |
 | `name` | string | no | Job name (auto-generated if omitted on `add`) |
 | `schedule` | string | on `add` | Cron expression, ISO timestamp, relative time (`+10s`, `+5m`), or interval (`5m`) |
 | `prompt` | string | on `add` | Prompt text to execute when the job fires |
@@ -125,6 +125,9 @@ The widget displays below your editor (only when jobs exist):
 | `notify` | boolean | no | Legacy subagent switch. `true` wakes the parent after every run. For recurring health checks prefer `notifyOn: "anomaly"` |
 | `notifyOn` | `always` \| `never` \| `anomaly` | no | Subagent-only wake policy. `anomaly` wakes only for failures or output containing `HEARTBEAT_ALERT`, `ALERT`, `ERROR`, `FAILED`, `OOM`, `DEAD`, `UNREACHABLE`, or `BLOCKED` |
 | `displayOn` | `always` \| `anomaly` \| `never` | no | Subagent-only chat-display policy, orthogonal to `notifyOn`. `anomaly` renders markers only for failures/anomalous output — healthy runs post **nothing** to the chat or the parent model context (outputs are archived on disk instead, see `action="logs"`). `never` renders no markers at all (wake per `notifyOn` still applies). Default `always` (legacy behavior) |
+| `resident` | boolean | no | Subagent-only (requires `model`). Keep one agent session alive across fires — the heartbeat remembers previous beats and reports trends — and enable `action="ask"` to interrogate it ad hoc. The session auto-resets with a handoff summary when its transcript grows too large |
+| `contextNote` | string | no | Subagent-only. Briefing embedded once when a resident session is created: background the heartbeat agent should always know. Bounded to 4k chars |
+| `question` | string | on `ask` | Ad-hoc question sent into a resident job's session; its full answer is returned |
 | `stopOn` | string | no | Subagent-only literal completion marker. A successful recurring job is disabled immediately when its output contains this marker |
 | `tail` | integer 1–50 | no | `logs` action only. How many archived runs to return, newest first (default 5) |
 | `extensions` | boolean or string[] | no | Subagent-only. If `true`, loads all registered extensions; an array of package names loads only those. Unset or empty array = none (default). Enabling extensions also grants the subagent the full builtin toolset (not just the default read/write/bash set) — required for extension-provided tools to activate. No-op for inline (no-model) jobs |
@@ -199,8 +202,9 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 
 **Widget:**
 
+- Three styles via `/schedule-prompt → Settings → Widget style` (persisted like other settings): **compact** (default — one borderless progress line below the editor, e.g. `♥ hb ✓ local 10.2M/20.5M · in 12m`, anomalous/error/running jobs first, width-truncated with `+N` overflow), **table** (the classic bordered per-job table), **hidden**. Legacy `widgetVisible: false` settings migrate to `hidden`
 - Auto-hides when no jobs configured
-- Shows: status icon, name, schedule (human-readable), prompt (truncated), next run, last run, run count
+- Table mode shows: status icon, name, schedule (human-readable), prompt (truncated), next run, last run, run count
 - Human-readable formatting: "every minute", "daily", "Feb 13 15:30" instead of raw cron/ISO
 - Auto-refreshes every 30 seconds
 - Visibility togglable via `/schedule-prompt → Settings`; persists across sessions (and package upgrades) in `<cwd>/.pi/schedule-prompts-settings.json`, with `~/.pi/agent/schedule-prompts-settings.json` as the global default
@@ -254,7 +258,7 @@ By default a scheduled prompt is injected into your current chat. Set `model` on
   → schedule="+30s", type=once, model="sonnet", prompt="Reply with OK"
 
 "check a long sweep without waking the parent when healthy"
-  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", displayOn="anomaly", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
+  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", displayOn="anomaly", resident=true, contextNote="arms: ls_herr/ls_cerr/sg; alert if GPU>11GiB local / >15GiB remote", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
 ```
 
 `model` is resolved at fire time. `current`/`same` follows the active parent model; `fast`/`heartbeat` first selects a known small sibling from that provider and otherwise uses a conservative name heuristic. The marker shows both the requested alias and the resolved model.
@@ -266,6 +270,22 @@ By default the result is shown in chat but the parent agent is **not** woken up.
 ```
 schedule_prompt action="logs" jobId="abc123" tail=10   → last 10 archived runs, newest first
 schedule_prompt action="logs"                          → per-job summary (runs, last outcome, log path)
+```
+
+**Wake suppression.** With `notifyOn: "anomaly"`, a *persistent* anomaly wakes the parent only on its first beat and then every 4th consecutive one — a lingering condition cannot ring every tick. The widget's `⚠` and the archive keep it visible between wakes, and a display-only recovery marker fires when the job returns to healthy.
+
+**Resident heartbeat agents.** Add `resident: true` (with `model`) to keep one agent session alive across beats instead of a fresh session per tick: the heartbeat remembers earlier beats and reports trends. The session is seeded once with a bounded text-only digest of the parent session plus your `contextNote`, pins its resolved model at creation, and resets automatically with a handoff summary when its transcript outgrows ~120k chars. The main agent can talk to it on demand:
+
+```
+schedule_prompt action="ask" jobId="abc123" question="why did GPU memory jump at beat 12?"
+```
+
+`ask` is inspection-only: it archives `kind:"ask"` entries but never advances beat counters, evaluates `stopOn`, or triggers notifications. Beats and asks share one busy guard — asking during a beat returns a retryable busy error.
+
+**Progress convention (`STATUS:`).** Every subagent beat prompt gets a one-line suffix asking the agent to make the **first line** of its reply exactly `STATUS: <one-line plain-text progress summary>`. The scheduler extracts that line (first non-empty line only — a `STATUS:` quoted deeper in the output does not count), strips terminal escape sequences, caps it at 240 chars, and persists it as the job's `lastStatusLine`. The compact widget renders it as a live progress readout:
+
+```
+♥ hb ✓ local 10.2M/20.5M shots · gpu 4.7GiB · eta 17:30 · in 12m
 ```
 
 Use `stopOn` for lifecycle completion instead of asking the background subagent to call `schedule_prompt`: scheduled subagents intentionally do not load extensions by default, so they cannot reliably remove their own parent job. For example, set `stopOn="DRIVER_DONE"` and make the prompt emit that literal marker only after final verification.

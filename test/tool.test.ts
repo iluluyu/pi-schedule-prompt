@@ -35,6 +35,7 @@ function makeScheduler() {
     updateJob: () => {},
     getNextRun: () => null,
     getRunLogBaseDir: () => "/tmp/pi-schedule-test-logs",
+    askResident: () => ({ ok: true, text: "because tier 2 started" }),
   } as any;
 }
 
@@ -633,5 +634,93 @@ describe("schedule_prompt — logs action", () => {
       makeCtx(),
     );
     expect(result.details?.error).toContain("Job not found");
+  });
+});
+
+describe("schedule_prompt — ask action + resident wiring", () => {
+  it("requires model for resident on add", async () => {
+    const { tool } = buildTool();
+    const result = await tool.execute(
+      "call",
+      {
+        action: "add",
+        schedule: "1h",
+        type: "interval",
+        prompt: "review a document", // not heartbeat-like → no auto model
+        resident: true,
+      } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toContain("'resident' requires 'model'");
+  });
+
+  it("stores resident and a bounded contextNote on add", async () => {
+    const { tool } = buildTool();
+    const result = await tool.execute(
+      "call",
+      {
+        action: "add",
+        schedule: "10m",
+        type: "interval",
+        prompt: "heartbeat",
+        model: "fast",
+        resident: true,
+        contextNote: "x".repeat(5000),
+      } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toBeUndefined();
+    const job = result.details?.jobs?.[0];
+    expect(job.resident).toBe(true);
+    expect(job.contextNote).toHaveLength(4000);
+  });
+
+  it("returns the resident agent's answer for ask", async () => {
+    const { tool } = buildTool([exampleJob({ id: "rjob", name: "hb", model: "fast", resident: true })]);
+    const result = await tool.execute(
+      "call",
+      { action: "ask", jobId: "rjob", question: "why did gpu spike?" } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toBeUndefined();
+    expect((result.content as { type: string; text: string }[])[0].text).toBe(
+      "because tier 2 started",
+    );
+  });
+
+  it("ask surfaces scheduler errors (busy / not resident)", async () => {
+    const storage = makeStorage([exampleJob({ id: "rjob2", model: "fast", resident: true })]);
+    const scheduler = {
+      ...makeScheduler(),
+      askResident: () => ({ ok: false, error: "Job 'hb' is busy (a beat is currently running); retry in a moment." }),
+    };
+    const tool = createCronTool(() => storage, () => scheduler as any, () => "session");
+    const result = await tool.execute(
+      "call",
+      { action: "ask", jobId: "rjob2", question: "status?" } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toContain("busy");
+    expect((result.content as { type: string; text: string }[])[0].text).toContain("✗");
+  });
+
+  it("ask requires both jobId and question", async () => {
+    const { tool } = buildTool();
+    const result = await tool.execute(
+      "call",
+      { action: "ask", jobId: "x" } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toContain("jobId and question");
   });
 });

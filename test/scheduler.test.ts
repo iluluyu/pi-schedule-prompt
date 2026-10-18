@@ -8,9 +8,11 @@ vi.mock("../src/subagent.js", () => ({
   modelReference: vi.fn(),
   resolveModel: vi.fn(() => undefined),
   runSubagentOnce: vi.fn(),
+  createSubagentSession: vi.fn(),
+  promptSubagentSession: vi.fn(),
 }));
 
-import { runSubagentOnce } from "../src/subagent.js";
+import { createSubagentSession, promptSubagentSession, runSubagentOnce } from "../src/subagent.js";
 
 // Scheduler tests must not touch the real run archive on disk.
 vi.mock("../src/run-log.js", () => ({
@@ -23,6 +25,8 @@ import { archiveRun } from "../src/run-log.js";
 
 const mockRunSubagentOnce = vi.mocked(runSubagentOnce);
 const mockArchiveRun = vi.mocked(archiveRun);
+const mockCreateSubagentSession = vi.mocked(createSubagentSession);
+const mockPromptSubagentSession = vi.mocked(promptSubagentSession);
 
 // In-memory CronStorage stand-in.
 function makeStorage(seedJobs: CronJob[] = []) {
@@ -876,5 +880,189 @@ describe("CronScheduler — displayOn quiet mode", () => {
     expect(pi.sendMessage.mock.calls[1][0].details.mode).toBe("subagent_done");
     expect(pi.sendMessage.mock.calls[1][0].display).toBe(true);
     expect(pi.sendMessage.mock.calls[1][1]).toBeUndefined(); // anomaly, healthy → no wake
+  });
+});
+
+describe("CronScheduler — resident sessions, status lines, alert suppression", () => {
+  beforeEach(() => {
+    mockRunSubagentOnce.mockReset();
+    mockArchiveRun.mockReset();
+    mockCreateSubagentSession.mockReset();
+    mockPromptSubagentSession.mockReset();
+  });
+
+  const fakeSession = () => ({ abort: vi.fn(), prompt: vi.fn() });
+  const okHandle = (session: any) => ({
+    session,
+    model: {} as any,
+    modelRef: "zai-coding-cn/glm-5.3-flash",
+    requestedModel: "fast",
+  });
+
+  function residentJob(overrides: Partial<CronJob> = {}): CronJob {
+    return exampleJob({
+      type: "cron",
+      schedule: "0 * * * * *",
+      model: "fast",
+      resident: true,
+      notifyOn: "anomaly",
+      displayOn: "anomaly",
+      ...overrides,
+    });
+  }
+
+  it("reuses one session across beats; the seed rides only the first beat", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "STATUS: fine\nHEARTBEAT_OK" });
+    const job = residentJob();
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).runCount).toBe(2));
+
+    expect(mockCreateSubagentSession).toHaveBeenCalledTimes(1);
+    expect(mockPromptSubagentSession).toHaveBeenCalledTimes(2);
+    const firstPrompt = mockPromptSubagentSession.mock.calls[0][1] as string;
+    expect(firstPrompt).toContain("persistent background heartbeat agent");
+    expect(firstPrompt).toContain(job.prompt);
+    expect(firstPrompt).toContain("STATUS:");
+    const secondPrompt = mockPromptSubagentSession.mock.calls[1][1] as string;
+    expect(secondPrompt).not.toContain("persistent background heartbeat agent");
+    expect(secondPrompt).toContain(job.prompt);
+  });
+
+  it("extracts and persists the STATUS progress line from the first non-empty line", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({
+      ok: true,
+      text: "STATUS: local 10.2M/20.5M shots | gpu 4.7GiB | eta 17:30\nHEARTBEAT_OK",
+    });
+    const job = residentJob();
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    const updated = storage.getJob(job.id);
+    expect(updated.lastStatusLine).toBe("local 10.2M/20.5M shots | gpu 4.7GiB | eta 17:30");
+    expect(updated.lastStatusLineAt).toBeDefined();
+  });
+
+  it("does not treat a STATUS line deeper in the output as progress", async () => {
+    mockRunSubagentOnce.mockResolvedValue({
+      ok: true,
+      text: "HEARTBEAT_OK\nsome quoted note: `STATUS: not a progress line`",
+    });
+    const job = exampleJob({ model: "haiku" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+    expect(storage.getJob(job.id).lastStatusLine).toBeUndefined();
+  });
+
+  it("ask interrogates the resident session without advancing beat counters", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "gpu spiked because tier 2 started" });
+    const job = residentJob();
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    const answer = await scheduler.askResident(job.id, "why did gpu spike?");
+
+    expect(answer).toEqual({ ok: true, text: "gpu spiked because tier 2 started" });
+    expect(storage.getJob(job.id).runCount).toBe(0);
+    expect(mockArchiveRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      job.id,
+      expect.objectContaining({ kind: "ask" }),
+    );
+  });
+
+  it("ask rejects non-resident jobs and busy jobs", async () => {
+    const scheduler = new CronScheduler(makeStorage([exampleJob({ id: "plain", model: "haiku" })]), makePi(), makeCtx());
+
+    const notResident = await scheduler.askResident("plain", "hi?");
+    expect(notResident.ok).toBe(false);
+    expect(notResident.ok === false && notResident.error).toContain("resident");
+
+    const job = residentJob({ id: "busyjob" });
+    const scheduler2 = new CronScheduler(makeStorage([job]), makePi(), makeCtx());
+    (scheduler2 as any).activeJobs.add("busyjob");
+    const busy = await scheduler2.askResident("busyjob", "hi?");
+    expect(busy.ok).toBe(false);
+    expect(busy.ok === false && busy.error).toContain("busy");
+  });
+
+  it("suppresses repeated anomaly wakes and re-wakes on the 4th consecutive beat", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_ALERT persists" });
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "always" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    const runOnce = async () => {
+      const pi = makePi();
+      (scheduler as any).pi = pi; // fresh capture per beat
+      await (scheduler as any).executeJobInSubagent(storage.getJob(job.id)!);
+      await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalled());
+      return pi;
+    };
+
+    const wakeOpts = (pi: any) => {
+      const done = pi.sendMessage.mock.calls.find((c: any[]) => c[0].details?.mode === "subagent_done");
+      return done?.[1];
+    };
+
+    expect(wakeOpts(await runOnce())).toEqual({ deliverAs: "followUp", triggerTurn: true }); // streak 1
+    expect(wakeOpts(await runOnce())).toBeUndefined(); // streak 2
+    expect(wakeOpts(await runOnce())).toBeUndefined(); // streak 3
+    expect(wakeOpts(await runOnce())).toEqual({ deliverAs: "followUp", triggerTurn: true }); // streak 4
+    expect(storage.getJob(job.id).lastAlertStreak).toBe(4);
+  });
+
+  it("posts a display-only recovery marker when an anomaly clears", async () => {
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "always" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_ALERT bad" });
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastOutcome).toBe("anomaly"));
+
+    const pi = makePi();
+    (scheduler as any).pi = pi;
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_OK good" });
+    await (scheduler as any).executeJobInSubagent(storage.getJob(job.id)!);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastOutcome).toBe("ok"));
+
+    const modes = pi.sendMessage.mock.calls.map((c: any[]) => c[0].details?.mode);
+    expect(modes).toContain("subagent_recovered");
+    const recovery = pi.sendMessage.mock.calls.find((c: any[]) => c[0].details?.mode === "subagent_recovered");
+    expect(recovery?.[1]).toBeUndefined(); // display-only, never wakes
+    expect(storage.getJob(job.id).lastAlertStreak).toBe(0);
+  });
+
+  it("disposes the resident session when the job config changes", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "HEARTBEAT_OK" });
+    const job = residentJob();
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    scheduler.updateJob(job.id, { ...storage.getJob(job.id)!, prompt: "changed prompt" });
+    expect(session.abort).toHaveBeenCalled();
+    expect((scheduler as any).residentSessions.size).toBe(0);
   });
 });

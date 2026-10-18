@@ -26,7 +26,10 @@ export default async function (pi: ExtensionAPI) {
   // Refreshed in initializeSession; mutated by Settings submenu. The tool and
   // widget read via closure so toggles take effect without re-registering.
   let settings: ScheduleSettings = {};
-  const isWidgetVisible = () => settings.widgetVisible !== false;
+  // widgetStyle is always set after loadSettings() (defaults "compact",
+  // migrating legacy widgetVisible:false → "hidden"); the fallback keeps
+  // the pre-initialize window safe.
+  const getWidgetStyle = () => settings.widgetStyle ?? "compact";
 
   // Register custom message renderer for scheduled prompts
   pi.registerMessageRenderer("scheduled_prompt", (message, _options, theme) => {
@@ -35,7 +38,7 @@ export default async function (pi: ExtensionAPI) {
           jobId: string;
           jobName: string;
           prompt: string;
-          mode?: "subagent_start" | "subagent_done" | "subagent_error";
+          mode?: "subagent_start" | "subagent_done" | "subagent_error" | "subagent_recovered";
           model?: string;
           output?: string;
           error?: string;
@@ -62,6 +65,9 @@ export default async function (pi: ExtensionAPI) {
         line =
           theme.fg("error", `✗ Scheduled${tag} failed: ${jobName}`) +
           (details?.error ? theme.fg("dim", ` → ${details.error}`) : "");
+        break;
+      case "subagent_recovered":
+        line = theme.fg("success", `✓ Scheduled${tag} recovered: ${jobName}`);
         break;
       default:
         line =
@@ -92,14 +98,12 @@ export default async function (pi: ExtensionAPI) {
     settings = loadSettings(ctx.cwd);
     storage = new CronStorage(ctx.cwd);
     scheduler = new CronScheduler(storage, pi, ctx);
-    widget = new CronWidget(storage, scheduler, pi, isWidgetVisible, ctx.sessionManager.getSessionId());
+    widget = new CronWidget(storage, scheduler, pi, getWidgetStyle, ctx.sessionManager.getSessionId());
 
     scheduler.start();
 
-    // Show widget
-    if (isWidgetVisible()) {
-      widget.show(ctx);
-    }
+    // Show widget (hidden style / zero jobs auto-hide inside show())
+    widget.show(ctx);
   };
 
   const cleanupSession = (ctx: any) => {
@@ -199,22 +203,23 @@ export default async function (pi: ExtensionAPI) {
           // Loop so the menu redraws with current state after each change —
           // the menu is the truth display; only persist failures need a toast.
           while (true) {
-            const widgetState = isWidgetVisible() ? "shown" : "hidden";
             const bound = (settings.defaultJobScope ?? "session") === "session";
             const choice = await ctx.ui.select("Settings", [
-              `Widget visibility: ${widgetState}`,
+              `Widget style: ${getWidgetStyle()}`,
               `Bind new jobs to session: ${bound ? "yes" : "no"}`,
               "Back",
             ]);
             if (!choice || choice === "Back") return;
-            if (choice.startsWith("Widget visibility:")) {
-              const next = !isWidgetVisible();
-              settings = { ...settings, widgetVisible: next };
-              next ? widget.show(ctx) : widget.hide(ctx);
-              const persisted = saveSettings(ctx.cwd, { widgetVisible: next });
+            if (choice.startsWith("Widget style:")) {
+              // Cycle compact → table → hidden → compact …
+              const order = ["compact", "table", "hidden"] as const;
+              const next = order[(order.indexOf(getWidgetStyle()) + 1) % order.length];
+              settings = { ...settings, widgetStyle: next };
+              next === "hidden" ? widget.hide(ctx) : widget.show(ctx);
+              const persisted = saveSettings(ctx.cwd, { widgetStyle: next });
               if (!persisted) {
                 ctx.ui.notify(
-                  `Widget ${next ? "shown" : "hidden"} (session only; failed to persist)`,
+                  `Widget style: ${next} (session only; failed to persist)`,
                   "warning",
                 );
               }

@@ -3,7 +3,15 @@ import { Cron } from "croner";
 import * as path from "path";
 import { archiveRun } from "./run-log.js";
 import type { CronStorage } from "./storage.js";
-import { modelReference, resolveModel, runSubagentOnce, type SubagentResult } from "./subagent.js";
+import {
+  createSubagentSession,
+  modelReference,
+  promptSubagentSession,
+  resolveModel,
+  runSubagentOnce,
+  type SubagentHandle,
+  type SubagentResult,
+} from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
 
 /** Result of `CronScheduler.validateSchedule`. On success, `schedule` is the
@@ -48,6 +56,82 @@ function shouldDisplay(job: CronJob, output: string, failed: boolean): boolean {
   return true;
 }
 
+/** Cap for a persisted STATUS: progress line. */
+const STATUS_LINE_MAX = 240;
+/** Transcript size (chars) at which a resident session resets with a handoff. */
+const RESIDENT_RESET_CHARS = 120_000;
+/** With notifyOn=anomaly, a persistent anomaly re-wakes only every Nth beat. */
+const ALERT_REWAKE_EVERY = 4;
+/** Suffix appended to subagent beat prompts so progress is machine-readable. */
+const STATUS_CONVENTION =
+  "\n\n(Output convention: make the FIRST line of your reply exactly `STATUS: <one-line plain-text progress summary, max 120 chars, no markdown>`; put all details after that line.)";
+
+/** Remove ANSI CSI/OSC sequences and C0 control chars from a status line. */
+function stripTerminalCodes(s: string): string {
+  return s
+    .replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "")
+    .replace(/\x1B\][^\x07\x1B]*(\x07|\x1B\\)?/g, "")
+    .replace(/[\x00-\x1F\x7F]/g, "");
+}
+
+/**
+ * Extract the `STATUS:` progress line. Only the FIRST non-empty output line
+ * is eligible — a `STATUS:` quoted deeper in the output is not a progress
+ * report. Returns undefined when absent; sanitized and length-capped.
+ */
+function extractStatusLine(rawOutput: string): string | undefined {
+  for (const line of rawOutput.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const m = trimmed.match(/^STATUS:\s*(.*)$/);
+    if (!m) return undefined;
+    const cleaned = stripTerminalCodes(m[1]).trim();
+    return cleaned ? cleaned.slice(0, STATUS_LINE_MAX) : undefined;
+  }
+  return undefined;
+}
+
+/** Bounded text-only digest of the parent session's active branch, used to
+ *  seed a resident subagent with main-agent context. Tool payloads, thinking
+ *  and non-message entries are skipped; each message is capped. */
+function buildParentDigest(entries: unknown[], maxChars = 8000): string {
+  const parts: string[] = [];
+  let total = 0;
+  for (const e of entries) {
+    const entry = e as { type?: string; message?: { role?: string; content?: unknown } };
+    if (entry?.type !== "message" || !entry.message) continue;
+    const role = entry.message.role ?? "user";
+    if (role === "system") continue;
+    let text = "";
+    const content = entry.message.content;
+    if (typeof content === "string") {
+      text = content;
+    } else if (Array.isArray(content)) {
+      text = content
+        .map((c) =>
+          c && typeof c === "object" && (c as { type?: string }).type === "text"
+            ? String((c as { text?: string }).text ?? "")
+            : "",
+        )
+        .join(" ");
+    }
+    text = stripTerminalCodes(text).trim();
+    if (!text) continue;
+    const chunk = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+    if (total + chunk.length > maxChars) break;
+    parts.push(`${role}: ${chunk}`);
+    total += chunk.length;
+  }
+  return parts.join("\n");
+}
+
+/** Live state for a job's resident subagent session. */
+interface ResidentRecord {
+  handle: SubagentHandle;
+  beats: number;
+  estChars: number;
+}
+
 /**
  * Manages cron job scheduling and execution
  */
@@ -61,6 +145,10 @@ export class CronScheduler {
   private readonly ctx: ExtensionContext;
   private currentModel: ExtensionContext["model"];
   private readonly logBaseDir: string;
+  /** Live resident sessions for jobs with resident=true. */
+  private residentSessions = new Map<string, ResidentRecord>();
+  /** Handoff summaries carried across resident resets (memory-bounded). */
+  private residentHandoffs = new Map<string, string>();
 
   constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext, logBaseDir?: string) {
     this.storage = storage;
@@ -112,6 +200,20 @@ export class CronScheduler {
    * Stop all scheduled jobs
    */
   stop(): void {
+    // Abort any in-flight subagent runs so they don't keep streaming or post
+    // markers against a stale pi reference after session shutdown.
+    for (const controller of this.activeSubagents) {
+      controller.abort();
+    }
+    this.activeSubagents.clear();
+    this.activeJobs.clear();
+
+    // Resident sessions outlive individual beats — dispose them explicitly.
+    for (const jobId of [...this.residentSessions.keys()]) {
+      this.disposeResident(jobId);
+    }
+    this.residentHandoffs.clear();
+
     // Stop all cron jobs
     for (const cron of this.jobs.values()) {
       cron.stop();
@@ -123,14 +225,6 @@ export class CronScheduler {
       clearInterval(interval);
     }
     this.intervals.clear();
-
-    // Abort any in-flight subagent runs so they don't keep streaming or post
-    // markers against a stale pi reference after session shutdown.
-    for (const controller of this.activeSubagents) {
-      controller.abort();
-    }
-    this.activeSubagents.clear();
-    this.activeJobs.clear();
   }
 
   /**
@@ -147,6 +241,8 @@ export class CronScheduler {
    * Remove and unschedule a job
    */
   removeJob(id: string): void {
+    this.disposeResident(id);
+    this.residentHandoffs.delete(id);
     this.unscheduleJob(id);
     this.emitChange({ type: "remove", jobId: id });
   }
@@ -155,6 +251,20 @@ export class CronScheduler {
    * Update a job (reschedule if needed)
    */
   updateJob(id: string, updated: CronJob): void {
+    // Configuration changes invalidate a resident session's memory — dispose
+    // so the next beat starts fresh (with a handoff) under the new config.
+    const previous = this.storage.getJob(id);
+    if (
+      previous &&
+      (previous.model !== updated.model ||
+        previous.prompt !== updated.prompt ||
+        previous.resident !== updated.resident ||
+        previous.contextNote !== updated.contextNote ||
+        JSON.stringify(previous.extensions) !== JSON.stringify(updated.extensions) ||
+        JSON.stringify(previous.skills) !== JSON.stringify(updated.skills))
+    ) {
+      this.disposeResident(id);
+    }
     this.unscheduleJob(id);
     if (updated.enabled) {
       this.scheduleJob(updated);
@@ -327,10 +437,139 @@ export class CronScheduler {
     }
   }
 
+  /** Drop a job's resident session (config change, removal, shutdown). */
+  private disposeResident(jobId: string): void {
+    const record = this.residentSessions.get(jobId);
+    if (!record) return;
+    this.residentSessions.delete(jobId);
+    try {
+      record.handle.session.abort();
+    } catch (error) {
+      console.warn(`[pi-schedule-prompt] failed to abort resident session for ${jobId}:`, error);
+    }
+  }
+
+  /** Build the seed prompt for a fresh resident session. Seeding happens via
+   *  the first beat prompt (no extra model turn is spent on the seed). */
+  private buildResidentSeed(job: CronJob, handoff?: string): string {
+    const lines: string[] = [
+      "You are a persistent background heartbeat agent. You are re-invoked on a schedule; each message is one beat. Remember earlier beats and report trends (memory, GPU, stage progress, error counts) — you are the memory of this experiment run.",
+    ];
+    if (job.contextNote) {
+      lines.push(`\nBackground you should always keep in mind:\n${job.contextNote.slice(0, 4000)}`);
+    }
+    let entries: unknown[] = [];
+    try {
+      entries = this.ctx.sessionManager.getEntries?.() ?? [];
+    } catch {
+      // digest is best-effort
+    }
+    const digest = buildParentDigest(entries);
+    if (digest) {
+      lines.push(
+        `\nParent session digest (bounded, text-only, for main-agent context):\n${digest}`,
+      );
+    }
+    if (handoff) {
+      lines.push(`\nHandoff from your previous session:\n${handoff}`);
+    }
+    return lines.join("\n");
+  }
+
+  /** Get or create the resident session for a job. The model is resolved and
+   *  pinned at creation; later main-model changes affect only new sessions. */
+  private async getOrCreateResident(
+    job: CronJob,
+  ): Promise<
+    { ok: true; record: ResidentRecord; seed?: string } | { ok: false; error: string }
+  > {
+    const existing = this.residentSessions.get(job.id);
+    if (existing) return { ok: true, record: existing };
+
+    const created = await createSubagentSession(this.ctx, job.model!, this.currentModel, {
+      extensions: job.extensions,
+      skills: job.skills,
+    });
+    if (!created.ok) return created;
+
+    const handoff = this.residentHandoffs.get(job.id);
+    this.residentHandoffs.delete(job.id);
+    const seed = this.buildResidentSeed(job, handoff);
+    const record: ResidentRecord = { handle: created.handle, beats: 0, estChars: seed.length };
+    this.residentSessions.set(job.id, record);
+    return { ok: true, record, seed };
+  }
+
+  /** Reset a resident session once its transcript outgrows the bound,
+   *  carrying a handoff summary into the fresh session on the next beat. */
+  private maybeResetResident(job: CronJob, lastOutput: string): void {
+    const record = this.residentSessions.get(job.id);
+    if (!record || record.estChars <= RESIDENT_RESET_CHARS) return;
+    const handoff = [
+      `Beats completed in your previous session: ${record.beats}.`,
+      job.lastStatusLine ? `Last status line: ${job.lastStatusLine}` : "",
+      `Last beat output (truncated):\n${lastOutput.slice(0, 2000)}`,
+      "Carry forward any open anomalies and baselines from your memory; re-summarize them in your next reply if still relevant.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    this.residentHandoffs.set(job.id, handoff);
+    this.disposeResident(job.id);
+    console.log(
+      `[pi-schedule-prompt] resident session for job ${job.id} reset (transcript bound ${RESIDENT_RESET_CHARS} chars)`,
+    );
+  }
+
+  /** Ad-hoc question into a job's resident session — the dialogue channel for
+   *  the main agent. Inspection-only: no counters, no stopOn, no wake logic. */
+  async askResident(jobId: string, question: string): Promise<SubagentResult> {
+    const job = this.storage.getJob(jobId);
+    if (!job) return { ok: false, error: `Job not found: ${jobId}` };
+    if (!job.model || !job.resident) {
+      return {
+        ok: false,
+        error: `Job "${job.name}" is not a resident subagent job — ask requires model + resident=true. Update the job or re-add it with resident=true.`,
+      };
+    }
+    if (!CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) {
+      return { ok: false, error: `Job "${job.name}" belongs to another session.` };
+    }
+    if (this.activeJobs.has(jobId)) {
+      return {
+        ok: false,
+        error: `Job "${job.name}" is busy (a beat is currently running); retry in a moment.`,
+      };
+    }
+    this.activeJobs.add(jobId);
+    try {
+      const resident = await this.getOrCreateResident(job);
+      if (!resident.ok) return { ok: false, error: resident.error };
+      const result = await promptSubagentSession(resident.record.handle.session, question);
+      resident.record.estChars +=
+        question.length + (result.ok ? result.text.length : result.error.length);
+      archiveRun(this.logBaseDir, this.ctx.cwd, job.id, {
+        ts: new Date().toISOString(),
+        outcome: result.ok ? "ok" : "error",
+        kind: "ask",
+        model: resident.record.handle.modelRef,
+        requestedModel: resident.record.handle.requestedModel,
+        ...(result.ok
+          ? { output: result.text || undefined }
+          : { error: result.error }),
+      });
+      if (result.ok) this.maybeResetResident(job, result.text);
+      return result;
+    } finally {
+      this.activeJobs.delete(jobId);
+    }
+  }
+
   /**
-   * Run a job's prompt in a fresh in-process AgentSession with the selected
-   * model. `current`/`same` and `fast` are resolved at fire time, so changing
-   * the main model does not leave a heartbeat pinned to an old model.
+   * Run a job's prompt in an in-process AgentSession with the selected model.
+   * Non-resident jobs get a fresh session per fire; resident jobs reuse one
+   * session (trend memory) with a bounded transcript. `current`/`same` and
+   * `fast` are resolved at fire time for fresh jobs and pinned at creation
+   * for resident ones.
    */
   private async executeJobInSubagent(job: CronJob): Promise<void> {
     const startedAt = Date.now();
@@ -377,18 +616,52 @@ export class CronScheduler {
 
     try {
       let result: SubagentResult;
-      try {
-        result = await runSubagentOnce(this.ctx, job.prompt, requestedModel, controller.signal, {
-          extensions: job.extensions,
-          skills: job.skills,
-        });
-      } finally {
-        this.activeSubagents.delete(controller);
+      if (job.resident) {
+        try {
+          const resident = await this.getOrCreateResident(job);
+          if (!resident.ok) {
+            result = { ok: false, error: resident.error };
+          } else {
+            const beatPrompt = resident.seed
+              ? `${resident.seed}\n\n--- Scheduled beat prompt (this and later messages are recurring beats):\n${job.prompt}${STATUS_CONVENTION}`
+              : `${job.prompt}${STATUS_CONVENTION}`;
+            result = await promptSubagentSession(
+              resident.record.handle.session,
+              beatPrompt,
+              controller.signal,
+            );
+            resident.record.beats += 1;
+            resident.record.estChars +=
+              beatPrompt.length + (result.ok ? result.text.length : result.error.length);
+            if (result.ok) this.maybeResetResident(job, result.text);
+          }
+        } finally {
+          this.activeSubagents.delete(controller);
+        }
+      } else {
+        try {
+          result = await runSubagentOnce(
+            this.ctx,
+            `${job.prompt}${STATUS_CONVENTION}`,
+            requestedModel,
+            controller.signal,
+            {
+              extensions: job.extensions,
+              skills: job.skills,
+            },
+          );
+        } finally {
+          this.activeSubagents.delete(controller);
+        }
       }
 
       // Scheduler was stopped (session shutdown / switch / fork) while we were
       // running. Don't touch storage or post markers — pi may be invalidated.
       if (controller.signal.aborted) return;
+
+      // The job may have been removed while the beat ran — never write
+      // completion state or post markers for a dead job.
+      if (!this.storage.getJob(job.id)) return;
 
       const nextRun = this.getNextRun(job.id);
 
@@ -400,16 +673,24 @@ export class CronScheduler {
         const outputSnippet = snippet(rawOutput) || "(subagent produced no text output)";
         const stopRequested = Boolean(job.stopOn && rawOutput.includes(job.stopOn));
         const anomalous = isAnomalyOutput(rawOutput);
+        const statusLine = extractStatusLine(rawOutput);
         // Re-read runCount from storage; `job` here is the closure-captured
         // snapshot from scheduleJob and would yield a stale count.
         const latest = this.storage.getJob(job.id);
         const currentRunCount = latest?.runCount ?? job.runCount;
+        const previousOutcome = latest?.lastOutcome;
+        const previousStreak = latest?.lastAlertStreak ?? 0;
+        const streak = anomalous ? (previousOutcome === "anomaly" ? previousStreak + 1 : 1) : 0;
         this.storage.updateJob(job.id, {
           lastRun: new Date().toISOString(),
           lastStatus: "success",
           lastOutcome: anomalous ? "anomaly" : "ok",
+          lastAlertStreak: streak,
           runCount: currentRunCount + 1,
           nextRun: nextRun?.toISOString(),
+          ...(statusLine !== undefined
+            ? { lastStatusLine: statusLine, lastStatusLineAt: new Date().toISOString() }
+            : {}),
           ...(stopRequested ? { enabled: false } : {}),
         });
         if (stopRequested) {
@@ -431,7 +712,48 @@ export class CronScheduler {
         // all — zero chat rows, zero parent-context growth. The run stays
         // visible in the widget and in the on-disk archive (action="logs").
         const displayEligible = shouldDisplay(job, rawOutput, false);
-        const wakeEligible = shouldNotify(job, rawOutput, false);
+        let wakeEligible = shouldNotify(job, rawOutput, false);
+        // Wake suppression: with notifyOn=anomaly, a PERSISTENT anomaly wakes
+        // the parent only on its first beat and then every ALERT_REWAKE_EVERY-th,
+        // so a lingering condition cannot ring every tick. The widget ⚠ and
+        // the archive keep it visible between wakes.
+        if (
+          wakeEligible &&
+          anomalous &&
+          job.notifyOn === "anomaly" &&
+          streak > 1 &&
+          streak % ALERT_REWAKE_EVERY !== 0
+        ) {
+          wakeEligible = false;
+        }
+        // Recovery marker (display-only, never wakes): the previous beat was
+        // anomalous or failed and this one is healthy again. Quiet jobs stay
+        // fully silent — the widget ⚠ simply clears.
+        if (displayEligible && previousOutcome && previousOutcome !== "ok" && !anomalous) {
+          try {
+            this.pi.sendMessage(
+              {
+                customType: "scheduled_prompt",
+                content: [
+                  {
+                    type: "text",
+                    text: `✓ Recovered: job "${job.name}" is healthy again (previous outcome: ${previousOutcome}).`,
+                  },
+                ],
+                display: true,
+                details: {
+                  jobId: job.id,
+                  jobName: job.name,
+                  prompt: job.prompt,
+                  mode: "subagent_recovered",
+                },
+              },
+              undefined,
+            );
+          } catch (markerErr) {
+            console.error(`Failed to post subagent_recovered marker for job ${job.id}:`, markerErr);
+          }
+        }
         if (displayEligible || wakeEligible) {
           try {
             this.pi.sendMessage(

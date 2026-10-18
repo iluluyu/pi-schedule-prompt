@@ -1,17 +1,70 @@
 /**
  * CronWidget — displays scheduled prompts below the editor
  *
- * Shows a table with status, name, schedule, next run, last run, and run count
+ * Two styles: "compact" (default; one borderless status line: icon, name,
+ * last STATUS: line, next run) and "table" (bordered table with status, name,
+ * schedule, next run, last run, and run count). "hidden" mounts nothing.
  * Auto-refreshes every 30 seconds to update relative times
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { CronScheduler, formatISOShort, humanizeCron } from "../scheduler.js";
 import type { CronStorage } from "../storage.js";
+import type { CronJob } from "../types.js";
 
 const WIDGET_ID = "schedule-prompts";
+
+/** Widget presentation style. `hidden` is the migration endpoint for the
+ *  legacy `widgetVisible: false` setting (see settings.ts). */
+export type WidgetStyle = "compact" | "table" | "hidden";
+
+/** Strip ANSI escapes and control characters from a status line before it is
+ *  embedded in the compact widget — subagent output is untrusted text. */
+function sanitizeStatusLine(line: string): string {
+  return line
+    .replace(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g, "")
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Status icon for a job — shared by the table rows and the compact line. */
+function statusIconFor(job: CronJob, theme: any): string {
+  if (!job.enabled) {
+    return theme.fg("muted", "✗");
+  }
+  if (job.lastStatus === "running") {
+    return theme.fg("warning", "⟳");
+  }
+  if (job.lastStatus === "error") {
+    return theme.fg("error", "!");
+  }
+  if (job.lastOutcome === "anomaly") {
+    // Succeeded but the output matched the anomaly regex — surfaced in
+    // chat when displayOn allows, still flagged here afterwards.
+    return theme.fg("warning", "⚠");
+  }
+  return theme.fg("success", "✓");
+}
+
+/** Compact-entry sort rank: needs-attention (error/anomaly/running) first,
+ *  healthy next, disabled last. */
+function compactRank(job: CronJob): number {
+  if (!job.enabled) return 4;
+  if (job.lastStatus === "error") return 0;
+  if (job.lastOutcome === "anomaly") return 1;
+  if (job.lastStatus === "running") return 2;
+  return 3;
+}
+
+/** Humanized schedule text (compact fallback when no status line). */
+function humanSchedule(job: CronJob): string {
+  if (job.type === "cron") return humanizeCron(job.schedule);
+  if (job.type === "once" && job.schedule.includes("T")) return formatISOShort(job.schedule);
+  return job.schedule;
+}
 
 /**
  * Format relative time (e.g., "in 5m", "2h ago")
@@ -53,7 +106,7 @@ export class CronWidget {
     private storage: CronStorage,
     private scheduler: CronScheduler,
     private pi: ExtensionAPI,
-    private isVisible: () => boolean,
+    private getStyle: () => WidgetStyle,
     private sessionId: string | undefined = undefined,
   ) {
     // Re-render on add/remove/update/fire/error so the row count, status icons,
@@ -71,7 +124,7 @@ export class CronWidget {
   show(ctx: any): void {
     this.ctx = ctx;
 
-    if (!this.isVisible() || this.loadedJobs().length === 0) {
+    if (this.getStyle() === "hidden" || this.loadedJobs().length === 0) {
       this.hide(ctx);
       return;
     }
@@ -106,17 +159,78 @@ export class CronWidget {
     if (this.ctx) this.show(this.ctx);
   }
 
+  /** Jobs this session loads, deduplicated by ID (safeguard against
+   *  rendering issues). */
+  private uniqueJobs(): CronJob[] {
+    return Array.from(new Map(this.loadedJobs().map((job) => [job.id, job])).values());
+  }
+
   /**
    * Render the widget content
    */
   private renderWidget(width: number, theme: any): string[] {
-    const jobs = this.loadedJobs();
+    return this.getStyle() === "table" ? this.renderTable(width, theme) : this.renderCompact(width, theme);
+  }
 
-    // Deduplicate jobs by ID (safeguard against rendering issues)
-    const uniqueJobs = Array.from(
-      new Map(jobs.map(job => [job.id, job])).values()
-    );
-    
+  /** Compact style: one borderless status line. Entries sorted by urgency,
+   *  joined with " · ", truncated to the render width; entries dropped for
+   *  width are counted in a trailing " +N". */
+  private renderCompact(width: number, theme: any): string[] {
+    const entries = this.uniqueJobs()
+      .slice()
+      .sort((a, b) => compactRank(a) - compactRank(b))
+      .map((job) => this.compactEntry(job, theme));
+
+    const prefix = `${theme.fg("error", "♥")} `;
+    const separator = " · ";
+    let line = prefix;
+    let used = visibleWidth(prefix);
+    let dropped = 0;
+
+    for (let i = 0; i < entries.length; i++) {
+      const chunk = (i === 0 ? "" : separator) + entries[i];
+      const chunkWidth = visibleWidth(chunk);
+      if (used + chunkWidth > width) {
+        dropped = entries.length - i;
+        break;
+      }
+      line += chunk;
+      used += chunkWidth;
+    }
+
+    if (dropped > 0) {
+      const suffix = line.endsWith(" ") ? `+${dropped}` : ` +${dropped}`;
+      const suffixWidth = visibleWidth(suffix);
+      if (used + suffixWidth > width) {
+        line = truncateToWidth(line, Math.max(0, width - suffixWidth), "") + suffix;
+      } else {
+        line += suffix;
+      }
+    }
+
+    // Final width safety (e.g. degenerate widths smaller than the prefix).
+    return [truncateToWidth(line, width, "")];
+  }
+
+  /** One compact entry: `icon name` + dim status line (or humanized schedule)
+   *  + relative next run. */
+  private compactEntry(job: CronJob, theme: any): string {
+    const icon = statusIconFor(job, theme);
+    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
+    const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
+    const detail = theme.fg("dim", detailRaw);
+    const nextRun = this.scheduler.getNextRun(job.id);
+    const parts = [`${icon} ${name}`, detail];
+    if (nextRun) parts.push(formatRelativeTime(nextRun));
+    return parts.join(" ");
+  }
+
+  /**
+   * Render the widget content — bordered per-job table
+   */
+  private renderTable(width: number, theme: any): string[] {
+    const uniqueJobs = this.uniqueJobs();
+
     const container = new Container();
     const borderColor = (s: string) => theme.fg("accent", s);
 
@@ -135,20 +249,7 @@ export class CronWidget {
     const lines: string[] = [];
     for (const job of uniqueJobs) {
       // Status icon
-      let statusIcon: string;
-      if (!job.enabled) {
-        statusIcon = theme.fg("muted", "✗");
-      } else if (job.lastStatus === "running") {
-        statusIcon = theme.fg("warning", "⟳");
-      } else if (job.lastStatus === "error") {
-        statusIcon = theme.fg("error", "!");
-      } else if (job.lastOutcome === "anomaly") {
-        // Succeeded but the output matched the anomaly regex — surfaced in
-        // chat when displayOn allows, still flagged here afterwards.
-        statusIcon = theme.fg("warning", "⚠");
-      } else {
-        statusIcon = theme.fg("success", "✓");
-      }
+      const statusIcon = statusIconFor(job, theme);
 
       // Name (max 15 chars for column, pad before coloring)
       const nameRaw = job.name.length > 15 ? job.name.substring(0, 12) + "..." : job.name;

@@ -9,8 +9,10 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 export type JobScope = "session" | "workdir";
 
 export interface ScheduleSettings {
-  /** Default true. Project file overrides global. */
+  /** Legacy visibility flag. `false` migrates to `widgetStyle: "hidden"`. */
   widgetVisible?: boolean;
+  /** Widget style: `compact` (default; one borderless progress line), `table` (bordered per-job table), or `hidden`. */
+  widgetStyle?: "compact" | "table" | "hidden";
   /**
    * Default scope for newly-created jobs. `"session"` (default) writes
    * `session: <currentSessionId>` so only the creating pi fires the job;
@@ -26,6 +28,9 @@ function sanitize(raw: unknown): ScheduleSettings {
   const r = raw as Record<string, unknown>;
   const out: ScheduleSettings = {};
   if (typeof r.widgetVisible === "boolean") out.widgetVisible = r.widgetVisible;
+  if (r.widgetStyle === "compact" || r.widgetStyle === "table" || r.widgetStyle === "hidden") {
+    out.widgetStyle = r.widgetStyle;
+  }
   if (r.defaultJobScope === "session" || r.defaultJobScope === "workdir") {
     out.defaultJobScope = r.defaultJobScope;
   }
@@ -44,7 +49,13 @@ function read(path: string): ScheduleSettings {
 }
 
 export function loadSettings(cwd: string): ScheduleSettings {
-  return { ...read(join(getAgentDir(), FILE)), ...read(join(cwd, ".pi", FILE)) };
+  const merged = { ...read(join(getAgentDir(), FILE)), ...read(join(cwd, ".pi", FILE)) };
+  // Migration + default: an explicit widgetVisible:false means "hidden";
+  // everything else defaults to the compact progress line.
+  if (!merged.widgetStyle) {
+    merged.widgetStyle = merged.widgetVisible === false ? "hidden" : "compact";
+  }
+  return merged;
 }
 
 /**
