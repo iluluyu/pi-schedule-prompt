@@ -16,6 +16,35 @@ Schedule future prompts with natural language:
 
 ## Features
 
+### A quiet heartbeat in 60 seconds
+
+The battle-tested recipe for long experiments (GPU/swap/log watches, sampling
+monitors): a cheap-model subagent beats on an interval, the chat stays
+completely silent while healthy, the compact widget shows live progress, and
+the parent is only woken when something is wrong.
+
+```
+schedule_prompt action=add type=interval schedule=15m model=fast   notifyOn=anomaly displayOn=anomaly   prompt=Check nvidia-smi memory, swap, and the tail of run.log against
+         the alert thresholds. First line of your reply MUST be
+         "STATUS: <one-line progress summary>" (this feeds the widget);
+         include ALERT on that line when a threshold is breached.
+         HEARTBEAT_OK elsewhere. stopOn=ALL_SAMPLING_DONE
+```
+
+What you get:
+
+- **Zero chat / zero parent-context cost** while healthy — no start markers, no snippets
+- The widget line below the editor: `◆ ● gpu-watch gpu 8.1/12GiB ok ▪▪▫▫▫ 15m`
+- Every beat is a real agent in `/agents` — scroll its dialogue, steer it live
+- `schedule_prompt action=logs` (or `p` in `/schedule-prompt → Jobs`) reads archived runs
+- On `ALERT`: the parent wakes with the full output; a persistent anomaly re-wakes only every 4th beat; recovery posts a display-only marker
+- On `ALL_SAMPLING_DONE` (the `stopOn` regex): the job disables itself and hands control back for finalization
+
+**Multiple windows:** jobs are session-bound by default — only the creating
+window schedules them. `scope=shared` jobs run from every window in the
+project, guarded by a cross-window claim so two open windows never double the
+beat rate.
+
 ### Core `schedule_prompt` Tool
 
 - **Natural language scheduling**: "schedule X in 5 minutes", "every hour do Y"

@@ -1556,3 +1556,67 @@ describe("CronScheduler — sol final-review fixes", () => {
     expect(prompt).toContain("status?");
   });
 });
+
+describe("CronScheduler — shared-job cross-window claim", () => {
+  beforeEach(() => {
+    mockRunSubagentOnce.mockReset();
+    mockArchiveRun.mockReset();
+    mockCreateSubagentSession.mockReset();
+    mockPromptSubagentSession.mockReset();
+    mockResolveModel.mockReset();
+  });
+
+  const sharedSubagentJob = () =>
+    exampleJob({ type: "cron", schedule: "0 * * * * *", model: "fast", session: undefined });
+
+  it("a fresh claim by another session skips the fire (no double beats)", async () => {
+    const job = sharedSubagentJob();
+    const storage = makeStorage([{ ...job }]); // shared: no session binding
+    const winA = new CronScheduler(storage, makePi(), makeCtx("window-a"));
+    const winB = new CronScheduler(storage, makePi(), makeCtx("window-b"));
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "STATUS: ok" });
+
+    await (winA as any).executeJob(job); // claims synchronously, fires detached
+    await (winB as any).executeJob(job); // sees the fresh claim, skips
+
+    // Exactly one beat ran: B saw A's fresh claim and skipped.
+    await vi.waitFor(() => expect(mockArchiveRun).toHaveBeenCalledTimes(1));
+    const stored = storage.getJob(job.id)!;
+    expect(stored.lastClaimSession).toBe("window-a");
+  });
+
+  it("a stale claim lets the other window take over", async () => {
+    const job = sharedSubagentJob();
+    const storage = makeStorage([
+      {
+        ...job,
+        lastClaimAt: new Date(Date.now() - 10 * 60_000).toISOString(), // 10min old
+        lastClaimSession: "window-a",
+      },
+    ]);
+    const winB = new CronScheduler(storage, makePi(), makeCtx("window-b"));
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "STATUS: ok" });
+
+    await (winB as any).executeJob(job);
+    await vi.waitFor(() => expect(mockArchiveRun).toHaveBeenCalledTimes(1));
+    expect(storage.getJob(job.id)!.lastClaimSession).toBe("window-b");
+  });
+
+  it("session-bound jobs never write claim fields", async () => {
+    const job = exampleJob({
+      type: "cron",
+      schedule: "0 * * * * *",
+      model: "fast",
+      session: "test-session", // bound to this ctx's session
+    });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "STATUS: ok" });
+
+    await (scheduler as any).executeJob(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id)!.lastStatus).toBe("success"));
+    const stored = storage.getJob(job.id)!;
+    expect(stored.lastClaimAt).toBeUndefined();
+    expect(stored.lastClaimSession).toBeUndefined();
+  });
+});

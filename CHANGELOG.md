@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`STATUS:` progress convention**: beat prompts ask for a first-line `STATUS: <summary>`; the scheduler extracts it (first non-empty line only, terminal escapes stripped, 240-char cap) and persists `lastStatusLine`/`lastStatusLineAt` for the compact widget
 - **Compact widget** (new default `widgetStyle`): one borderless progress line below the editor rendering `lastStatusLine` per job, anomalous/error/running jobs first, width-aware truncation with `+N` overflow; `table` keeps the classic view, `hidden` disables; legacy `widgetVisible:false` migrates to `hidden`; cycled from `/schedule-prompt → Settings → Widget style`
 - **Alert wake suppression + recovery**: with `notifyOn:"anomaly"`, a persistent anomaly re-wakes the parent only every 4th consecutive beat; a display-only recovery marker fires when the job returns to healthy
+- **Beat progress meter in the compact widget**: a 5-cell `▪▪▫▫▫` slider (filled=success green, hollow track=dim) fills with time since the last beat and resets on fire, followed by lowercase Go-style total tokens (`30s`/`5m`/`2h`/`1d`); 1-second refresh tick; interval jobs track their next-fire timestamp (setInterval exposes none). All widget glyphs (status icons `● ◐ ■ ▲ ○`, `◆` prefix) stay in the font-safe Geometric Shapes family — some terminal fonts flatten Block Elements and Dingbats into full cells
+- **Compact-line layout**: at most 5 jobs share one horizontally justified line (equal width share each, entries compressed internally identity>progress>next-run, overflow hidden); full-width justification spreads slack into the separators
+- **`p` peek**: `/schedule-prompt → Jobs` opens a read-only overlay over the job's archived runs — deliberately not an entry into the agent session (live view + steering remain in `/agents`, itself an overlay, never a session switch)
+- **Cross-window claim for shared jobs**: session-unbound jobs are scheduled by every pi window in the cwd; a fire now claims `lastClaimAt`/`lastClaimSession` in storage and other sessions skip while the claim is fresh (half the beat period, 5s–5min), so two open windows no longer double the beat rate
+
+### Fixed
+- Resident-prompt exceptions reach the failure pipeline (no more `lastStatus` stuck on `running`), thrown prompts are archived as errors
+- `updateJob` accepts an explicit pre-update snapshot — the tool persists before scheduling, so the scheduler compared the updated config against itself and never invalidated resident sessions on prompt/model changes
+- Deferred resident creation validates lifecycle after the await: removal/config-change/shutdown during creation aborts the stale handle instead of resurrecting an orphan; an already-aborted signal never starts a prompt
+- One wall-clock beat deadline covers all runners (RPC, resident, in-process fallback): a hung prompt no longer pins `activeJobs`; a timed-out beat records a terminal error and disposes the aborted resident session
+- `ask` before the first beat prepends the resident seed instead of silently discarding initialization
+- RPC client hardening per dual audit: `data.version===2` ping check with cooldown + `subagents:ready` invalidation, lifecycle listeners installed before spawn with early-event buffering, one overall deadline with stop+consume on abort, canonical `provider/id` model references, configurable `job.agentType`
 
 ## [0.4.1] - 2026-06-23
 

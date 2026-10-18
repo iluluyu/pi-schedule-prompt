@@ -72,6 +72,11 @@ export interface CronJob {
   lastAlertStreak?: number;
   /** Subagent jobs only. Disable a recurring job after a successful result containing this literal marker. */
   stopOn?: string;
+  /** Cross-window claim for shared jobs: when this session last fired the
+   *  beat (ISO). Other sessions skip while the claim is fresh. */
+  lastClaimAt?: string;
+  /** Session id that wrote lastClaimAt. */
+  lastClaimSession?: string;
   /** Subagent jobs only. If true, loads all registered extensions. If an array of package names, only those extensions. Default undefined (none). */
   extensions?: boolean | string[];
   /** Subagent jobs only. If true, loads all skills. If an array of skill names, only those skills. Default undefined (none). */

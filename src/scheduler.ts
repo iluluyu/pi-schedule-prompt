@@ -418,6 +418,24 @@ export class CronScheduler {
     if (!fresh?.enabled) return;
     if (!CronScheduler.isLoadedFor(fresh, this.ctx.sessionManager.getSessionId())) return;
 
+    // Shared (session-unbound) jobs are scheduled by EVERY pi window in this
+    // cwd — without a claim, two open windows double the beat rate. Claim the
+    // fire here; skip if another session claimed within the freshness window
+    // (half the beat period, capped at 5 minutes, so a closed window's claim
+    // goes stale long before the next beat and a survivor takes over).
+    if (!fresh.session) {
+      const mySession = this.ctx.sessionManager.getSessionId();
+      const period = this.getBeatPeriodMs(fresh.id) ?? 60_000;
+      const windowMs = Math.max(5_000, Math.min(period / 2, 300_000));
+      const claimedAt = fresh.lastClaimAt ? new Date(fresh.lastClaimAt).getTime() : 0;
+      const claimedByOther = fresh.lastClaimSession && fresh.lastClaimSession !== mySession;
+      if (claimedByOther && Date.now() - claimedAt < windowMs) return;
+      this.storage.updateJob(fresh.id, {
+        lastClaimAt: new Date().toISOString(),
+        lastClaimSession: mySession,
+      });
+    }
+
     if (!fresh.model) {
       console.log(`Executing scheduled prompt: ${fresh.name} (${fresh.id})`);
     }
