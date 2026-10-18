@@ -121,8 +121,10 @@ The widget displays below your editor (only when jobs exist):
 | `jobId` | string | on `remove` / `enable` / `disable` / `update` | Target job |
 | `type` | `cron` \| `once` \| `interval` | no | Job type. Default `cron`; use `once` for relative times like `+10s` |
 | `description` | string | no | Free-form note |
-| `model` | non-empty string | no | If set, run the prompt in a fresh in-process agent session with this model instead of injecting into the current chat. Accepts fuzzy names (`haiku`, `sonnet`) or `provider/model-id`. To switch a job from subagent back to inline mode, remove and re-add it without `model` (no in-place clearing) |
-| `notify` | boolean | no | Subagent-only. If `true`, the parent agent is woken to react to the subagent's result. Default `false` (result shown in chat, parent not interrupted). No-op for inline (no-model) jobs — the prompt itself already wakes the parent. Recommended only for low-frequency jobs |
+| `model` | non-empty string | no | If set, run the prompt in a fresh in-process agent session instead of injecting it into the current chat. Accepts fuzzy names, `provider/model-id`, or dynamic aliases `current`/`same` (active model) and `fast`/`heartbeat` (small sibling from the active provider). To switch a job back to inline, remove and re-add it without `model` |
+| `notify` | boolean | no | Legacy subagent switch. `true` wakes the parent after every run. For recurring health checks prefer `notifyOn: "anomaly"` |
+| `notifyOn` | `always` \| `never` \| `anomaly` | no | Subagent-only wake policy. `anomaly` wakes only for failures or output containing `HEARTBEAT_ALERT`, `ALERT`, `ERROR`, `FAILED`, `OOM`, `DEAD`, `UNREACHABLE`, or `BLOCKED` |
+| `stopOn` | string | no | Subagent-only literal completion marker. A successful recurring job is disabled immediately when its output contains this marker |
 | `extensions` | boolean or string[] | no | Subagent-only. If `true`, loads all registered extensions; an array of package names loads only those. Unset or empty array = none (default). Enabling extensions also grants the subagent the full builtin toolset (not just the default read/write/bash set) — required for extension-provided tools to activate. No-op for inline (no-model) jobs |
 | `skills` | boolean or string[] | no | Subagent-only. If `true`, loads all skills; an array of skill names loads only those. Unset or empty array = none (default). No-op for inline (no-model) jobs |
 
@@ -187,6 +189,8 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 **Safety:**
 
 - **Infinite loop prevention**: Blocks scheduled jobs from creating more schedules
+- **Heartbeat isolation**: Explicit recurring heartbeat/GPU/patrol prompts are automatically moved to `model="fast"` + `notifyOn="anomaly"` when no model is supplied
+- **Overlap prevention**: A slow subagent heartbeat cannot start a second copy before the previous tick finishes
 - **Past timestamp detection**: Auto-disables jobs scheduled in the past
 - **Duplicate names**: Prevents name collisions
 - **Auto-cleanup**: Removes disabled jobs on exit
@@ -245,13 +249,22 @@ By default a scheduled prompt is injected into your current chat. Set `model` on
 
 "in 30s reply with OK using sonnet"
   → schedule="+30s", type=once, model="sonnet", prompt="Reply with OK"
+
+"check a long sweep without waking the parent when healthy"
+  → schedule="10m", type=interval, model="fast", notifyOn="anomaly", prompt="Output HEARTBEAT_OK when healthy; output HEARTBEAT_ALERT plus diagnosis on an anomaly"
 ```
 
-`model` is permissive: pass a fuzzy name (`haiku`, `sonnet`) or fully qualified `provider/model-id`. The first match in the available model registry is used. When the job fires you'll see a `🕐 Scheduled (subagent: <model>)` marker in chat, followed by a `✓ finished` (or `✗ failed`) marker with the response snippet once the subagent completes.
+`model` is resolved at fire time. `current`/`same` follows the active parent model; `fast`/`heartbeat` first selects a known small sibling from that provider and otherwise uses a conservative name heuristic. The marker shows both the requested alias and the resolved model.
 
-By default the result is shown in chat but the parent agent is **not** woken up — you read it, the agent isn't interrupted. Set `notify: true` on the job if you want the parent to react to each completion (e.g. for autonomous workflows). Recommended only for low-frequency jobs; a `notify: true` recurring job that fires every 5 minutes will trigger a parent-agent turn every 5 minutes.
+By default the result is shown in chat but the parent agent is **not** woken up. Use `notifyOn: "anomaly"` for recurring health checks, or `notify: true`/`notifyOn: "always"` for low-frequency workflows. A recurring job with an anomaly policy does not create a parent turn for every healthy tick.
+
+Use `stopOn` for lifecycle completion instead of asking the background subagent to call `schedule_prompt`: scheduled subagents intentionally do not load extensions by default, so they cannot reliably remove their own parent job. For example, set `stopOn="DRIVER_DONE"` and make the prompt emit that literal marker only after final verification.
 
 > **Heads up:** Subagent jobs run unattended at fire time with the full default tool set (`bash`, `read`, `edit`, `write`, …) under your credentials. Treat persisted jobs in `.pi/schedule-prompts.json` as you would any auto-executed task — review prompts before adding, especially anything that mutates files or shells out.
+
+## Local fork maintenance
+
+This checkout is loaded by path (via `pi.extensions` in your Pi settings) rather than updated in place by Pi's remote package updater. The `upstream` Git remote points to the standard project. Before merging upstream changes, run `git fetch upstream`, review the diff, then run `npm run typecheck`, `npm test`, and `npm run lint`.
 
 ## Development
 

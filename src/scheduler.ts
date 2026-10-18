@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import type { CronStorage } from "./storage.js";
-import { runSubagentOnce, type SubagentResult } from "./subagent.js";
+import { modelReference, resolveModel, runSubagentOnce, type SubagentResult } from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
 
 /** Result of `CronScheduler.validateSchedule`. On success, `schedule` is the
@@ -19,6 +19,16 @@ function snippet(text: string): string {
     : text;
 }
 
+const ANOMALY_OUTPUT = /\b(?:HEARTBEAT_ALERT|ALERT|CRITICAL|ERROR|FAILED|OOM|DEAD|UNREACHABLE|BLOCKED)\b/i;
+
+function shouldNotify(job: CronJob, output: string, failed: boolean): boolean {
+  if (job.notifyOn === "never") return false;
+  if (job.notifyOn === "always") return true;
+  if (job.notifyOn === "anomaly") return failed || ANOMALY_OUTPUT.test(output);
+  // Keep the pre-0.5 boolean behavior for existing jobs.
+  return job.notify === true;
+}
+
 /**
  * Manages cron job scheduling and execution
  */
@@ -26,14 +36,22 @@ export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private activeSubagents = new Set<AbortController>();
+  private activeJobs = new Set<string>();
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly ctx: ExtensionContext;
+  private currentModel: ExtensionContext["model"];
 
   constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext) {
     this.storage = storage;
     this.pi = pi;
     this.ctx = ctx;
+    this.currentModel = ctx.model;
+  }
+
+  /** Keep dynamic model aliases aligned with `/model` changes in the parent session. */
+  setCurrentModel(model: ExtensionContext["model"]): void {
+    this.currentModel = model;
   }
 
   /**
@@ -84,6 +102,7 @@ export class CronScheduler {
       controller.abort();
     }
     this.activeSubagents.clear();
+    this.activeJobs.clear();
   }
 
   /**
@@ -210,10 +229,16 @@ export class CronScheduler {
     if (!fresh?.enabled) return;
     if (!CronScheduler.isLoadedFor(fresh, this.ctx.sessionManager.getSessionId())) return;
 
-    console.log(`Executing scheduled prompt: ${job.name} (${job.id})`);
+    console.log(`Executing scheduled prompt: ${fresh.name} (${fresh.id})`);
 
-    if (job.model) {
-      this.executeJobInSubagent(job);
+    if (fresh.model) {
+      // A slow health check must not overlap with the next interval. Overlap
+      // was a major source of duplicate diagnostics and quota consumption.
+      if (this.activeJobs.has(fresh.id)) return;
+      this.activeJobs.add(fresh.id);
+      void this.executeJobInSubagent(fresh)
+        .catch((error) => console.error(`Scheduled subagent job ${fresh.id} failed:`, error))
+        .finally(() => this.activeJobs.delete(fresh.id));
       return;
     }
 
@@ -275,12 +300,14 @@ export class CronScheduler {
   }
 
   /**
-   * Run a job's prompt in a fresh in-process AgentSession with the chosen model.
-   * Fire-and-forget: the cron tick returns immediately so other jobs keep firing.
+   * Run a job's prompt in a fresh in-process AgentSession with the selected
+   * model. `current`/`same` and `fast` are resolved at fire time, so changing
+   * the main model does not leave a heartbeat pinned to an old model.
    */
-  private executeJobInSubagent(job: CronJob): void {
-    const model = job.model!;
-    const notify = job.notify === true;
+  private async executeJobInSubagent(job: CronJob): Promise<void> {
+    const requestedModel = job.model!;
+    const resolvedModel = resolveModel(this.ctx.modelRegistry, requestedModel, this.currentModel);
+    const model = resolvedModel ? modelReference(resolvedModel) : requestedModel;
     this.storage.updateJob(job.id, { lastStatus: "running" });
     this.emitChange({ type: "fire", job });
 
@@ -288,117 +315,138 @@ export class CronScheduler {
     // Pi-ai's openai-completions provider filters out user messages with
     // empty content — if the marker lands right after an assistant message,
     // the conversation ends on assistant and Anthropic 400s.
-    this.pi.sendMessage({
-      customType: "scheduled_prompt",
-      content: [{ type: "text", text: `🕐 Scheduled (subagent: ${model}): ${job.name}` }],
-      display: true,
-      details: {
-        jobId: job.id,
-        jobName: job.name,
-        prompt: job.prompt,
-        mode: "subagent_start",
-        model,
-      },
-    });
+    try {
+      this.pi.sendMessage({
+        customType: "scheduled_prompt",
+        content: [{ type: "text", text: `🕐 Scheduled (subagent: ${model}): ${job.name}` }],
+        display: true,
+        details: {
+          jobId: job.id,
+          jobName: job.name,
+          prompt: job.prompt,
+          mode: "subagent_start",
+          model,
+          requestedModel,
+        },
+      });
+    } catch (error) {
+      this.storage.updateJob(job.id, {
+        lastRun: new Date().toISOString(),
+        lastStatus: "error",
+      });
+      console.error(`Failed to post subagent_start marker for job ${job.id}:`, error);
+      return;
+    }
 
     const controller = new AbortController();
     this.activeSubagents.add(controller);
 
-    void (async () => {
+    try {
+      let result: SubagentResult;
       try {
-        let result: SubagentResult;
-        try {
-          result = await runSubagentOnce(this.ctx, job.prompt, model, controller.signal, { extensions: job.extensions, skills: job.skills });
-        } finally {
-          this.activeSubagents.delete(controller);
-        }
-
-        // Scheduler was stopped (session shutdown / switch / fork) while we were
-        // running. Don't touch storage or post markers — pi may be invalidated.
-        if (controller.signal.aborted) return;
-
-        const nextRun = this.getNextRun(job.id);
-
-        // Always advance the storage state to a terminal status BEFORE attempting
-        // to post the marker. The marker is best-effort (pi may be invalidated
-        // during teardown) and must never leave the job stuck in "running".
-        if (result.ok) {
-          const outputSnippet = snippet(result.text.trim()) || "(subagent produced no text output)";
-          // Re-read runCount from storage; `job` here is the closure-captured
-          // snapshot from scheduleJob and would yield a stale count.
-          const latest = this.storage.getJob(job.id);
-          const currentRunCount = latest?.runCount ?? job.runCount;
-          this.storage.updateJob(job.id, {
-            lastRun: new Date().toISOString(),
-            lastStatus: "success",
-            runCount: currentRunCount + 1,
-            nextRun: nextRun?.toISOString(),
-          });
-          this.emitChange({ type: "fire", job });
-          try {
-            // notify=true: snippet in `content` + followUp/triggerTurn wakes
-            // the parent — it sees the result and reacts.
-            // notify=false: content is still non-empty (guarded by #10 fallback)
-            // to prevent session poisoning — pi-ai filters empty user messages,
-            // leaving the conversation ending on assistant which Anthropic 400s.
-            // No delivery options means the marker is silent (parent not woken).
-            this.pi.sendMessage(
-              {
-                customType: "scheduled_prompt",
-                content: [{ type: "text", text: outputSnippet }],
-                display: true,
-                details: {
-                  jobId: job.id,
-                  jobName: job.name,
-                  prompt: job.prompt,
-                  mode: "subagent_done",
-                  model,
-                  output: outputSnippet,
-                },
-              },
-              notify ? { deliverAs: "followUp", triggerTurn: true } : undefined,
-            );
-          } catch (markerErr) {
-            console.error(`Failed to post subagent_done marker for job ${job.id}:`, markerErr);
-          }
-        } else {
-          // Truncate the error the same way as the success snippet — verbose
-          // API errors / stack traces would otherwise overflow the chat row.
-          const errorSnippet = snippet(result.error.trim()) || "(subagent failed with empty error)";
-          this.storage.updateJob(job.id, {
-            lastRun: new Date().toISOString(),
-            lastStatus: "error",
-            nextRun: nextRun?.toISOString(),
-          });
-          this.emitChange({ type: "error", jobId: job.id, error: errorSnippet });
-          try {
-            // Same notify-gated wake-up as the done marker — see comment above.
-            this.pi.sendMessage(
-              {
-                customType: "scheduled_prompt",
-                content: [{ type: "text", text: errorSnippet }],
-                display: true,
-                details: {
-                  jobId: job.id,
-                  jobName: job.name,
-                  prompt: job.prompt,
-                  mode: "subagent_error",
-                  model,
-                  error: errorSnippet,
-                },
-              },
-              notify ? { deliverAs: "followUp", triggerTurn: true } : undefined,
-            );
-          } catch (markerErr) {
-            console.error(`Failed to post subagent_error marker for job ${job.id}:`, markerErr);
-          }
-        }
-      } catch (error) {
-        // Outer backstop: anything else (e.g. storage write failure) shouldn't
-        // escape the IIFE as an unhandled rejection.
-        console.error(`Subagent completion handler failed for job ${job.id}:`, error);
+        result = await runSubagentOnce(this.ctx, job.prompt, requestedModel, controller.signal, {
+          extensions: job.extensions,
+          skills: job.skills,
+        });
+      } finally {
+        this.activeSubagents.delete(controller);
       }
-    })();
+
+      // Scheduler was stopped (session shutdown / switch / fork) while we were
+      // running. Don't touch storage or post markers — pi may be invalidated.
+      if (controller.signal.aborted) return;
+
+      const nextRun = this.getNextRun(job.id);
+
+      // Always advance the storage state to a terminal status BEFORE attempting
+      // to post the marker. The marker is best-effort (pi may be invalidated
+      // during teardown) and must never leave the job stuck in "running".
+      if (result.ok) {
+        const rawOutput = result.text.trim();
+        const outputSnippet = snippet(rawOutput) || "(subagent produced no text output)";
+        const stopRequested = Boolean(job.stopOn && rawOutput.includes(job.stopOn));
+        // Re-read runCount from storage; `job` here is the closure-captured
+        // snapshot from scheduleJob and would yield a stale count.
+        const latest = this.storage.getJob(job.id);
+        const currentRunCount = latest?.runCount ?? job.runCount;
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(),
+          lastStatus: "success",
+          runCount: currentRunCount + 1,
+          nextRun: nextRun?.toISOString(),
+          ...(stopRequested ? { enabled: false } : {}),
+        });
+        if (stopRequested) {
+          // Preserve the terminal result, but do not wait for the next tick
+          // to discover that the completion marker was reached.
+          this.unscheduleJob(job.id);
+          this.emitChange({ type: "update", job: { ...job, enabled: false } });
+        }
+        this.emitChange({ type: "fire", job });
+        try {
+          // A recurring heartbeat should normally use notifyOn="anomaly";
+          // healthy results remain visible but do not wake the parent model.
+          this.pi.sendMessage(
+            {
+              customType: "scheduled_prompt",
+              content: [{ type: "text", text: outputSnippet }],
+              display: true,
+              details: {
+                jobId: job.id,
+                jobName: job.name,
+                prompt: job.prompt,
+                mode: "subagent_done",
+                model,
+                requestedModel,
+                output: outputSnippet,
+              },
+            },
+            shouldNotify(job, rawOutput, false)
+              ? { deliverAs: "followUp", triggerTurn: true }
+              : undefined,
+          );
+        } catch (markerErr) {
+          console.error(`Failed to post subagent_done marker for job ${job.id}:`, markerErr);
+        }
+      } else {
+        // Truncate the error the same way as the success snippet — verbose
+        // API errors / stack traces would otherwise overflow the chat row.
+        const errorSnippet = snippet(result.error.trim()) || "(subagent failed with empty error)";
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(),
+          lastStatus: "error",
+          nextRun: nextRun?.toISOString(),
+        });
+        this.emitChange({ type: "error", jobId: job.id, error: errorSnippet });
+        try {
+          // Same notify-gated wake-up as the done marker — see comment above.
+          this.pi.sendMessage(
+            {
+              customType: "scheduled_prompt",
+              content: [{ type: "text", text: errorSnippet }],
+              display: true,
+              details: {
+                jobId: job.id,
+                jobName: job.name,
+                prompt: job.prompt,
+                mode: "subagent_error",
+                model,
+                requestedModel,
+                error: errorSnippet,
+              },
+            },
+            shouldNotify(job, errorSnippet, true)
+              ? { deliverAs: "followUp", triggerTurn: true }
+              : undefined,
+          );
+        } catch (markerErr) {
+          console.error(`Failed to post subagent_error marker for job ${job.id}:`, markerErr);
+        }
+      }
+    } catch (error) {
+      // Backstop: storage or marker failures must not become unhandled rejections.
+      console.error(`Subagent completion handler failed for job ${job.id}:`, error);
+    }
   }
 
   /**

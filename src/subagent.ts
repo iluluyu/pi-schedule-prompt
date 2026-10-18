@@ -31,10 +31,72 @@ export interface RunSubagentOptions {
   skills?: boolean | string[];
 }
 
+const CURRENT_MODEL_ALIASES = new Set(["current", "same", "same-model", "current-model"]);
+const FAST_MODEL_ALIASES = new Set(["fast", "fastest", "heartbeat"]);
+
+// Prefer a provider's explicitly advertised fast variant before using a
+// heuristic. These IDs are only candidates; auth and availability still come
+// from the live model registry. Keep this list minimal: only true budget
+// tiers (-flash suffix). Do not add flagship-priced variants here.
+const FAST_MODEL_IDS: Record<string, string[]> = {
+  "zai-coding-cn": ["glm-5.3-flash"],
+  antigravity: ["gemini-3.8-flash"],
+  deepseek: ["deepseek-flash"],
+};
+
+export function modelReference(model: Model<any>): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function fastModelScore(model: Model<any>, current: Model<any> | undefined): number {
+  const id = `${model.id} ${model.name}`.toLowerCase();
+  let score = model.provider === current?.provider ? 100 : 0;
+  if (/flash|mini|haiku|nano|small|lite|fast|spark|turbo|air/.test(id)) score += 50;
+  // "highspeed" = flagship-priced high-speed reasoning variant, not a cheap tier.
+  if (/highspeed|opus|pro|max|ultra|reasoning/.test(id)) score -= 30;
+  // Among otherwise similar siblings, prefer the lower API-equivalent cost.
+  score -= ((model.cost?.input ?? 0) + (model.cost?.output ?? 0)) * 5;
+  if (model.id === current?.id) score -= 1000;
+  return score;
+}
+
+/** Pick a small model from the current provider, falling back to the current model. */
+export function resolveFastModel(
+  registry: ExtensionContext["modelRegistry"],
+  current: Model<any> | undefined,
+): Model<any> | undefined {
+  const available = registry.getAvailable();
+  const preferred = current ? FAST_MODEL_IDS[current.provider] ?? [] : [];
+  for (const id of preferred) {
+    // A sibling may be configured but omitted from getAvailable() while the
+    // provider's auth check is refreshing. It is safe to reuse the already
+    // authenticated current provider for this explicit sibling.
+    const exact = current
+      ? registry.find(current.provider, id) ??
+        available.find((candidate) => candidate.provider === current.provider && candidate.id.toLowerCase() === id)
+      : undefined;
+    if (exact) return exact;
+  }
+
+  const ranked = available
+    .filter((candidate) => candidate.id !== current?.id)
+    .map((candidate, index) => ({ candidate, index }))
+    .sort((a, b) =>
+      fastModelScore(b.candidate, current) - fastModelScore(a.candidate, current) ||
+      a.index - b.index,
+    );
+  return ranked[0]?.candidate ?? current;
+}
+
 export function resolveModel(
   registry: ExtensionContext["modelRegistry"],
   modelStr: string,
+  currentModel?: Model<any>,
 ): Model<any> | undefined {
+  const normalized = modelStr.trim().toLowerCase();
+  if (CURRENT_MODEL_ALIASES.has(normalized)) return currentModel;
+  if (FAST_MODEL_ALIASES.has(normalized)) return resolveFastModel(registry, currentModel);
+
   let fuzzyNeedle = modelStr;
   const slash = modelStr.indexOf("/");
   if (slash !== -1) {
@@ -95,7 +157,7 @@ export async function runSubagentOnce(
   options: RunSubagentOptions = {},
 ): Promise<SubagentResult> {
   try {
-    const model = resolveModel(ctx.modelRegistry, modelStr);
+    const model = resolveModel(ctx.modelRegistry, modelStr, ctx.model);
     if (!model) {
       return {
         ok: false,
@@ -148,7 +210,6 @@ export async function runSubagentOnce(
       agentDir,
       sessionManager: SessionManager.inMemory(ctx.cwd),
       settingsManager: SettingsManager.create(ctx.cwd, agentDir),
-      modelRegistry: ctx.modelRegistry,
       model,
       tools: isEnabled(options.extensions) ? undefined : DEFAULT_TOOL_NAMES,
       resourceLoader: loader,

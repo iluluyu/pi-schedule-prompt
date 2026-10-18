@@ -140,6 +140,10 @@ export default async function (pi: ExtensionAPI) {
     initializeSession(ctx);
   });
 
+  pi.on("model_select", (event) => {
+    scheduler?.setCurrentModel(event.model);
+  });
+
   pi.on("session_shutdown", async (_event, ctx) => {
     autoCleanupDisabledJobs(ctx);
     cleanupSession(ctx);

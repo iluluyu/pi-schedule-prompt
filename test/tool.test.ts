@@ -75,6 +75,49 @@ function exampleJob(overrides: Partial<CronJob> = {}): CronJob {
 
 describe("schedule_prompt — notify behavior", () => {
   describe("add", () => {
+    it("automatically backgrounds an explicit recurring heartbeat", async () => {
+      const { tool } = buildTool();
+      const result = await tool.execute(
+        "call",
+        {
+          action: "add",
+          schedule: "1h",
+          type: "interval",
+          name: "GPU heartbeat",
+          prompt: "check nvidia-smi and swap; output HEARTBEAT_OK when healthy",
+        } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      expect(result.details?.error).toBeUndefined();
+      expect(result.details?.jobs?.[0].model).toBe("fast");
+      expect(result.details?.jobs?.[0].notifyOn).toBe("anomaly");
+    });
+
+    it("stores anomaly notification and completion-stop policies", async () => {
+      const { tool } = buildTool();
+      const result = await tool.execute(
+        "call",
+        {
+          action: "add",
+          schedule: "1h",
+          type: "interval",
+          prompt: "check the sweep",
+          model: "fast",
+          notifyOn: "anomaly",
+          stopOn: "DRIVER_DONE",
+        } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      expect(result.details?.error).toBeUndefined();
+      expect(result.details?.jobs?.[0].model).toBe("fast");
+      expect(result.details?.jobs?.[0].notifyOn).toBe("anomaly");
+      expect(result.details?.jobs?.[0].stopOn).toBe("DRIVER_DONE");
+    });
+
     it("accepts notify=true without model (no-op for inline jobs)", async () => {
       const { tool } = buildTool();
       const result = await tool.execute(

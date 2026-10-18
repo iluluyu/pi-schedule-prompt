@@ -7,6 +7,17 @@ import type { CronStorage } from "./storage.js";
 import type { CronJob, CronJobType, CronToolDetails, } from "./types.js";
 import { CronToolParams } from "./types.js";
 
+function looksLikeMonitoringJob(params: {
+  type?: CronJobType;
+  name?: string;
+  description?: string;
+  prompt?: string;
+}): boolean {
+  if (params.type === "once") return false;
+  const text = [params.name, params.description, params.prompt].filter(Boolean).join(" ").toLowerCase();
+  return /heartbeat|心跳|巡查|巡检|patrol|health check|long[- ]running|tmux|kill -0|nvidia-smi|swap|gpu|进程存活/.test(text);
+}
+
 /**
  * Create the schedule_prompt tool definition.
  * `getDefaultScope` is a getter so live setting toggles affect the next `add`.
@@ -20,7 +31,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup. For recurring monitoring, set model='fast' or 'current' and notifyOn='anomaly'; explicit heartbeat/GPU/patrol prompts are auto-backgrounded as model='fast' when model is omitted.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -87,6 +98,12 @@ export function createCronTool(
             const now = new Date().toISOString();
             const session =
               getDefaultScope() === "session" ? ctx.sessionManager.getSessionId() : undefined;
+            const autoBackground = !params.model && looksLikeMonitoringJob({
+              type,
+              name: jobName,
+              description: params.description,
+              prompt: params.prompt,
+            });
             const job: CronJob = {
               id: nanoid(10),
               name: jobName,
@@ -98,8 +115,10 @@ export function createCronTool(
               createdAt: now,
               runCount: 0,
               description: params.description,
-              model: params.model,
+              model: params.model ?? (autoBackground ? "fast" : undefined),
               notify: params.notify,
+              notifyOn: (params.notifyOn ?? (autoBackground && params.notify !== true ? "anomaly" : undefined)) as CronJob["notifyOn"],
+              stopOn: params.stopOn,
               extensions: params.extensions,
               skills: params.skills,
               session,
@@ -112,7 +131,7 @@ export function createCronTool(
             details.jobName = job.name;
 
             const modelLine = job.model
-              ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
+              ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
               : "";
             return {
               content: [
@@ -249,6 +268,8 @@ export function createCronTool(
             if (params.description !== undefined) updates.description = params.description;
             if (params.model !== undefined) updates.model = params.model;
             if (params.notify !== undefined) updates.notify = params.notify;
+            if (params.notifyOn !== undefined) updates.notifyOn = params.notifyOn as CronJob["notifyOn"];
+            if (params.stopOn !== undefined) updates.stopOn = params.stopOn;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;
 
@@ -304,8 +325,9 @@ export function createCronTool(
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
               if (job.model) {
-                lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
+                lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
               }
+              if (job.stopOn) lines.push(`  Stop on: ${job.stopOn}`);
               lines.push(`  Prompt: ${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
@@ -399,11 +421,13 @@ export function createCronTool(
           if (job.model) {
             const subagentTag = job.notify ? "(subagent, notifies parent)" : "(subagent)";
             const tags = [];
+            if (job.notifyOn) tags.push(`notify=${job.notifyOn}`);
             if (job.extensions) tags.push("extensions");
             if (job.skills) tags.push("skills");
             const tagStr = tags.length ? ", " + tags.join(" + ") : "";
             lines.push(`  ${theme.fg("dim", "Model:")} ${job.model} ${theme.fg("dim", subagentTag)}${tagStr}`);
           }
+          if (job.stopOn) lines.push(`  ${theme.fg("dim", "Stop on:")} ${job.stopOn}`);
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {
             lines.push(`  ${theme.fg("dim", "Last run:")} ${job.lastRun}`);

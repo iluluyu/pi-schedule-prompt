@@ -10,6 +10,9 @@ export type CronJobType = "cron" | "once" | "interval";
  */
 export type CronJobStatus = "success" | "error" | "running";
 
+/** How a background job wakes its parent session. */
+export type NotifyMode = "always" | "never" | "anomaly";
+
 /**
  * A scheduled cron job
  */
@@ -42,8 +45,12 @@ export interface CronJob {
   description?: string;
   /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */
   model?: string;
-  /** Subagent jobs only. If true, the parent agent is woken up to react to the subagent's result. Default false (result lands in chat silently). */
+  /** Subagent jobs only. Legacy switch: true wakes the parent after every run. */
   notify?: boolean;
+  /** Subagent jobs only. Prefer `anomaly` for recurring health checks to avoid waking the parent when healthy. */
+  notifyOn?: NotifyMode;
+  /** Subagent jobs only. Disable a recurring job after a successful result containing this literal marker. */
+  stopOn?: string;
   /** Subagent jobs only. If true, loads all registered extensions. If an array of package names, only those extensions. Default undefined (none). */
   extensions?: boolean | string[];
   /** Subagent jobs only. If true, loads all skills. If an array of skill names, only those skills. Default undefined (none). */
@@ -119,7 +126,20 @@ export const CronToolParams = Type.Object({
   notify: Type.Optional(
     Type.Boolean({
       description:
-        "Subagent jobs only. If true, the parent agent is nudged to react to the subagent's result. Default false: the result is shown in chat but the parent is not interrupted. Ignored for inline (no-model) jobs, where the prompt itself already wakes the parent. Recommended only for low-frequency jobs.",
+        "Legacy subagent switch. If true, wake the parent after every run. For recurring health checks prefer notifyOn='anomaly'.",
+    })
+  ),
+  notifyOn: Type.Optional(
+    StringEnum(["always", "never", "anomaly"], {
+      description:
+        "Subagent notification policy: always, never, or anomaly (wake only when output contains HEARTBEAT_ALERT/ALERT/ERROR/FAILED/OOM/DEAD/UNREACHABLE/BLOCKED).",
+    })
+  ),
+  stopOn: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description:
+        "Subagent jobs only. Disable a recurring job after a successful result contains this literal completion marker.",
     })
   ),
   extensions: Type.Optional(

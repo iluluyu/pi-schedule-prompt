@@ -58,6 +58,15 @@ describe("resolveModel", () => {
     expect(resolveModel(makeRegistry(), "gpt-4o")).toEqual(MODELS[3]);
   });
 
+  it("resolves current/same aliases to the active model", () => {
+    expect(resolveModel(makeRegistry(), "current", MODELS[1])).toEqual(MODELS[1]);
+    expect(resolveModel(makeRegistry(), "same", MODELS[1])).toEqual(MODELS[1]);
+  });
+
+  it("resolves fast to a lightweight sibling from the active provider", () => {
+    expect(resolveModel(makeRegistry(), "fast", MODELS[1])).toEqual(MODELS[2]);
+  });
+
   it("is case-insensitive on exact id", () => {
     expect(resolveModel(makeRegistry(), "GPT-4o")).toEqual(MODELS[3]);
   });

@@ -5,6 +5,8 @@ import type { CronJob } from "../src/types.js";
 // Mock the subagent runner: scheduler tests don't actually want to spin up an
 // in-memory AgentSession, just verify the scheduler's wiring around it.
 vi.mock("../src/subagent.js", () => ({
+  modelReference: vi.fn(),
+  resolveModel: vi.fn(() => undefined),
   runSubagentOnce: vi.fn(),
 }));
 
@@ -120,6 +122,42 @@ describe("CronScheduler — subagent path marker delivery", () => {
     const [doneMsg, doneOpts] = pi.sendMessage.mock.calls[1];
     expect(doneMsg.content).toEqual([{ type: "text", text: "OK" }]);
     expect(doneOpts).toEqual({ deliverAs: "followUp", triggerTurn: true });
+  });
+
+  it("only wakes the parent for anomaly output when notifyOn=anomaly", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_OK" });
+    const pi = makePi();
+    const job = exampleJob({ model: "haiku", notifyOn: "anomaly" });
+    const scheduler = new CronScheduler(makeStorage([job]), pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(2));
+    expect(pi.sendMessage.mock.calls[1][1]).toBeUndefined();
+
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "HEARTBEAT_ALERT GPU OOM" });
+    pi.sendMessage.mockClear();
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(2));
+    expect(pi.sendMessage.mock.calls[1][1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+  });
+
+  it("disables a recurring job when its stopOn marker is returned", async () => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "DRIVER_DONE" });
+    const pi = makePi();
+    const job = exampleJob({
+      type: "cron",
+      schedule: "0 * * * * *",
+      model: "haiku",
+      stopOn: "DRIVER_DONE",
+    });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    expect(storage.getJob(job.id).enabled).toBe(false);
+    expect((scheduler as any).jobs.has(job.id)).toBe(false);
   });
 
   it("posts a subagent_error marker with notify-gated wake-up", async () => {
