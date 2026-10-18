@@ -574,6 +574,55 @@ export class CronScheduler {
     }
   }
 
+  /** Recent text-only dialogue of a job's resident session — the "view the
+   *  subagent's conversation" channel. Bounded per message; live only (the
+   *  archive covers completed runs). */
+  residentTranscript(
+    jobId: string,
+    tail = 20,
+  ): { ok: true; beats: number; model: string; lines: string[] } | { ok: false; error: string } {
+    const record = this.residentSessions.get(jobId);
+    if (!record) {
+      const job = this.storage.getJob(jobId);
+      if (!job) return { ok: false, error: `Job not found: ${jobId}` };
+      if (!job.resident) {
+        return {
+          ok: false,
+          error: `Job "${job.name}" has no resident session (resident=false). Use action="logs" for archived outputs.`,
+        };
+      }
+      return {
+        ok: false,
+        error: `Job "${job.name}" has not fired yet — its resident session is created on the first beat.`,
+      };
+    }
+    const limit = Math.min(Math.max(Math.trunc(tail) || 20, 1), 100);
+    const lines: string[] = [];
+    for (const msg of record.handle.session.messages as Array<{
+      role?: string;
+      content?: unknown;
+    }>) {
+      const role = msg.role ?? "user";
+      let text = "";
+      const content = msg.content;
+      if (typeof content === "string") {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content
+          .map((p) =>
+            p && typeof p === "object" && (p as { type?: string }).type === "text"
+              ? String((p as { text?: string }).text ?? "")
+              : "",
+          )
+          .join("");
+      }
+      text = stripTerminalCodes(text).trim();
+      if (!text) continue;
+      lines.push(`${role}: ${text.length > 1000 ? `${text.slice(0, 1000)}…` : text}`);
+    }
+    return { ok: true, beats: record.beats, model: record.handle.modelRef, lines: lines.slice(-limit) };
+  }
+
   /**
    * Run a job's prompt in an in-process AgentSession with the selected model.
    * Non-resident jobs get a fresh session per fire; resident jobs reuse one

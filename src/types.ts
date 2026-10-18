@@ -99,7 +99,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "logs", "ask"], {
+  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "logs", "ask", "transcript"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -180,7 +180,7 @@ export const CronToolParams = Type.Object({
     Type.Integer({
       minimum: 1,
       maximum: 50,
-      description: "Action='logs' only. Number of archived runs to return, newest first (default 5).",
+      description: "Action='logs'/'transcript' only. Number of archived runs (logs, default 5) or recent dialogue messages (transcript, default 20) to return, newest last.",
     })
   ),
   stopOn: Type.Optional(

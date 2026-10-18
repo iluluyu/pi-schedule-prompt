@@ -1099,4 +1099,36 @@ describe("CronScheduler — resident sessions, status lines, alert suppression",
     expect(session.abort).toHaveBeenCalled();
     expect((scheduler as any).residentSessions.size).toBe(0);
   });
+
+  it("residentTranscript returns the live dialogue; errors guide non-resident jobs to logs", async () => {
+    const session = {
+      abort: vi.fn(),
+      messages: [
+        { role: "user", content: "seed + beat prompt" },
+        { role: "assistant", content: [{ type: "text", text: "STATUS: ok\nHEARTBEAT_OK" }] },
+      ],
+    };
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "STATUS: ok\nHEARTBEAT_OK" });
+    const job = residentJob();
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    const view = scheduler.residentTranscript(job.id);
+    expect(view.ok).toBe(true);
+    if (view.ok) {
+      expect(view.beats).toBe(1);
+      expect(view.lines.some((l) => l.startsWith("user: "))).toBe(true);
+      expect(view.lines.some((l) => l.includes("HEARTBEAT_OK"))).toBe(true);
+    }
+
+    const plain = exampleJob({ id: "plain2", model: "haiku" });
+    const scheduler2 = new CronScheduler(makeStorage([plain]), makePi(), makeCtx());
+    const err = scheduler2.residentTranscript("plain2");
+    expect(err.ok).toBe(false);
+    expect(err.ok === false && err.error).toContain('action="logs"');
+  });
 });

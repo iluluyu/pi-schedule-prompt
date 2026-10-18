@@ -452,6 +452,36 @@ export function createCronTool(
             };
           }
 
+          case "transcript": {
+            if (!params.jobId) {
+              throw new Error("action='transcript' requires jobId.");
+            }
+            const job = storage.getJob(params.jobId);
+            if (!job) {
+              throw new Error(`Job not found: ${params.jobId}`);
+            }
+            details.jobId = job.id;
+            details.jobName = job.name;
+
+            const view = scheduler.residentTranscript(params.jobId, params.tail ?? 20);
+            if (!view.ok) {
+              details.error = view.error;
+              return {
+                content: [{ type: "text", text: `✗ ${view.error}` }],
+                details,
+              };
+            }
+            const lines = [
+              `Resident session for "${job.name}" — model=${view.model}, beats=${view.beats}, last ${view.lines.length} messages:`,
+              "",
+              ...view.lines,
+            ];
+            return {
+              content: [{ type: "text", text: lines.join("\n") }],
+              details,
+            };
+          }
+
           default:
             throw new Error(`Unknown action: ${action}`);
         }

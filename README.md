@@ -114,7 +114,7 @@ The widget displays below your editor (only when jobs exist):
 
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
-| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` \| `logs` \| `ask` | yes | Operation to perform |
+| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` \| `logs` \| `ask` \| `transcript` | yes | Operation to perform |
 | `name` | string | no | Job name (auto-generated if omitted on `add`) |
 | `schedule` | string | on `add` | Cron expression, ISO timestamp, relative time (`+10s`, `+5m`), or interval (`5m`) |
 | `prompt` | string | on `add` | Prompt text to execute when the job fires |
@@ -129,7 +129,7 @@ The widget displays below your editor (only when jobs exist):
 | `contextNote` | string | no | Subagent-only. Briefing embedded once when a resident session is created: background the heartbeat agent should always know. Bounded to 4k chars |
 | `question` | string | on `ask` | Ad-hoc question sent into a resident job's session; its full answer is returned |
 | `stopOn` | string | no | Subagent-only literal completion marker. A successful recurring job is disabled immediately when its output contains this marker |
-| `tail` | integer 1–50 | no | `logs` action only. How many archived runs to return, newest first (default 5) |
+| `tail` | integer 1–50 | no | `logs`/`transcript` only. Runs returned for `logs` (default 5, newest first) or recent dialogue messages for `transcript` (default 20, newest last) |
 | `extensions` | boolean or string[] | no | Subagent-only. If `true`, loads all registered extensions; an array of package names loads only those. Unset or empty array = none (default). Enabling extensions also grants the subagent the full builtin toolset (not just the default read/write/bash set) — required for extension-provided tools to activate. No-op for inline (no-model) jobs |
 | `skills` | boolean or string[] | no | Subagent-only. If `true`, loads all skills; an array of skill names loads only those. Unset or empty array = none (default). No-op for inline (no-model) jobs |
 
@@ -280,7 +280,7 @@ schedule_prompt action="logs"                          → per-job summary (runs
 schedule_prompt action="ask" jobId="abc123" question="why did GPU memory jump at beat 12?"
 ```
 
-`ask` is inspection-only: it archives `kind:"ask"` entries but never advances beat counters, evaluates `stopOn`, or triggers notifications. Beats and asks share one busy guard — asking during a beat returns a retryable busy error.
+`ask` is inspection-only: it archives `kind:"ask"` entries but never advances beat counters, evaluates `stopOn`, or triggers notifications. Beats and asks share one busy guard — asking during a beat returns a retryable busy error. Use `action="transcript"` (`jobId`, optional `tail`) to view the resident session's live dialogue — the equivalent of a subagent conversation viewer for heartbeat agents.
 
 **Progress convention (`STATUS:`).** Every subagent beat prompt gets a one-line suffix asking the agent to make the **first line** of its reply exactly `STATUS: <one-line plain-text progress summary>`. The scheduler extracts that line (first non-empty line only — a `STATUS:` quoted deeper in the output does not count), strips terminal escape sequences, caps it at 240 chars, and persists it as the job's `lastStatusLine`. The compact widget renders it as a live progress readout:
 

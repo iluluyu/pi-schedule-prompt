@@ -36,6 +36,7 @@ function makeScheduler() {
     getNextRun: () => null,
     getRunLogBaseDir: () => "/tmp/pi-schedule-test-logs",
     askResident: () => ({ ok: true, text: "because tier 2 started" }),
+    residentTranscript: () => ({ ok: true, beats: 2, model: "zai-coding-cn/glm-5.3-flash", lines: ["user: seed", "assistant: STATUS: ok"] }),
   } as any;
 }
 
@@ -722,5 +723,20 @@ describe("schedule_prompt — ask action + resident wiring", () => {
       makeCtx(),
     );
     expect(result.details?.error).toContain("jobId and question");
+  });
+
+  it("transcript renders the resident dialogue", async () => {
+    const { tool } = buildTool([exampleJob({ id: "tjob", name: "hb", model: "fast", resident: true })]);
+    const result = await tool.execute(
+      "call",
+      { action: "transcript", jobId: "tjob" } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toBeUndefined();
+    const text = (result.content as { type: string; text: string }[])[0].text;
+    expect(text).toContain("beats=2");
+    expect(text).toContain("assistant: STATUS: ok");
   });
 });
