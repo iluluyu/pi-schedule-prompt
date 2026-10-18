@@ -58,6 +58,8 @@ export interface CronJob {
   resident?: boolean;
   /** Subagent jobs only. Minutes a resident session may live before it is disposed and re-seeded (with a handoff summary) on the next beat. Bounds memory drift and token spend; 0 disables the time bound (the ~120k-char transcript bound still applies). Default 60. */
   residentTtlMinutes?: number;
+  /** Subagent jobs only. pi-subagents agent type used for RPC-spawned beats (default "general-purpose"). Ignored by the in-process fallback and resident mode. */
+  agentType?: string;
   /** Optional briefing embedded once when a resident session is created (or re-seeded after a reset). */
   contextNote?: string;
   /** Outcome of the last subagent run: healthy, anomalous-but-successful, or failed. */
@@ -171,6 +173,13 @@ export const CronToolParams = Type.Object({
       minimum: 0,
       maximum: 10080,
       description: "Subagent jobs only. Resident session lifetime in minutes before dispose-and-reseed with a handoff (default 60; 0 = chars bound only).",
+    })
+  ),
+  agentType: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description:
+        "Subagent jobs only. pi-subagents agent type for RPC-spawned beats (default 'general-purpose'). Set when your pi-subagents config disables the default type or provides a specialized one.",
     })
   ),
   contextNote: Type.Optional(

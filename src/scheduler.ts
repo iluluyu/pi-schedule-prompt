@@ -5,6 +5,7 @@ import { archiveRun, readRuns } from "./run-log.js";
 import type { CronStorage } from "./storage.js";
 import {
   createSubagentSession,
+  describeAvailableModels,
   modelReference,
   promptSubagentSession,
   resolveModel,
@@ -230,6 +231,7 @@ export class CronScheduler {
       this.disposeResident(jobId);
     }
     this.residentHandoffs.clear();
+    this.subagentsRpc.dispose();
 
     // Stop all cron jobs
     for (const cron of this.jobs.values()) {
@@ -732,26 +734,36 @@ export class CronScheduler {
       } else if (await this.subagentsRpc.ready()) {
         // Default runner: spawn through pi-subagents so every beat shows up in
         // the user's /agents conversation views (scrollable, steerable). Trend
-        // memory comes from the run archive instead of a live session.
+        // memory comes from the run archive instead of a live session. The
+        // controller's signal cancels the wait AND stops the host-side agent
+        // on scheduler shutdown.
         try {
-          const handle = `hb-${job.name}`
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-+|-+$/g, "")
-            .slice(0, 32);
-          result = await this.subagentsRpc.spawnAndWait(
-            {
-              type: "general-purpose",
-              prompt: `${job.prompt}${STATUS_CONVENTION}${this.recentBeatsMemory(job)}`,
-              name: handle || "hb",
-              description: `heartbeat: ${job.name}`,
-              // Pass the canonical provider/id — the RPC host does not know
-              // this plugin's `fast`/`current` aliases.
-              model,
-              isBackground: true,
-            },
-            BEAT_TIMEOUT_MS,
-          );
+          if (!resolvedModel) {
+            // Never forward an unresolved alias — the host's registry does
+            // not know this plugin's `fast`/`current` spellings.
+            result = {
+              ok: false,
+              error: `Unknown model '${requestedModel}'. ${describeAvailableModels(this.ctx.modelRegistry)}`,
+            };
+          } else {
+            const handle = `hb-${job.name}`
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/^-+|-+$/g, "")
+              .slice(0, 32);
+            result = await this.subagentsRpc.spawnAndWait(
+              {
+                type: job.agentType ?? "general-purpose",
+                prompt: `${job.prompt}${STATUS_CONVENTION}${this.recentBeatsMemory(job)}`,
+                name: handle || "hb",
+                description: `heartbeat: ${job.name}`,
+                model,
+                isBackground: true,
+              },
+              BEAT_TIMEOUT_MS,
+              controller.signal,
+            );
+          }
         } finally {
           this.activeSubagents.delete(controller);
         }

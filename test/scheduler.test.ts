@@ -5,14 +5,15 @@ import type { CronJob } from "../src/types.js";
 // Mock the subagent runner: scheduler tests don't actually want to spin up an
 // in-memory AgentSession, just verify the scheduler's wiring around it.
 vi.mock("../src/subagent.js", () => ({
-  modelReference: vi.fn(),
+  modelReference: vi.fn((m: any) => `${m.provider}/${m.id}`),
   resolveModel: vi.fn(() => undefined),
   runSubagentOnce: vi.fn(),
   createSubagentSession: vi.fn(),
   promptSubagentSession: vi.fn(),
+  describeAvailableModels: vi.fn(() => "No models with configured auth."),
 }));
 
-import { createSubagentSession, promptSubagentSession, runSubagentOnce } from "../src/subagent.js";
+import { createSubagentSession, promptSubagentSession, resolveModel, runSubagentOnce } from "../src/subagent.js";
 
 // Scheduler tests must not touch the real run archive on disk.
 vi.mock("../src/run-log.js", () => ({
@@ -27,6 +28,7 @@ const mockRunSubagentOnce = vi.mocked(runSubagentOnce);
 const mockArchiveRun = vi.mocked(archiveRun);
 const mockCreateSubagentSession = vi.mocked(createSubagentSession);
 const mockPromptSubagentSession = vi.mocked(promptSubagentSession);
+const mockResolveModel = vi.mocked(resolveModel);
 
 // In-memory CronStorage stand-in.
 function makeStorage(seedJobs: CronJob[] = []) {
@@ -923,6 +925,7 @@ describe("CronScheduler — resident sessions, status lines, alert suppression",
     mockArchiveRun.mockReset();
     mockCreateSubagentSession.mockReset();
     mockPromptSubagentSession.mockReset();
+    mockResolveModel.mockReset();
   });
 
   const fakeSession = () => ({ abort: vi.fn(), prompt: vi.fn() });
@@ -1181,6 +1184,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
     mockArchiveRun.mockReset();
     mockCreateSubagentSession.mockReset();
     mockPromptSubagentSession.mockReset();
+    mockResolveModel.mockReset();
   });
 
   /** Functional mini event bus — replies SYNCHRONOUSLY inside emit(), exactly
@@ -1208,13 +1212,13 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
           // Host handlers are async wrappers — replies land on microtasks, and
           // lifecycle events strictly after the spawn reply resolves.
           if (event === "subagents:rpc:ping") {
-            queueMicrotask(() => dispatch(`${event}:reply:${data.requestId}`, { success: true, version: 2 }));
+            queueMicrotask(() => dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 2 } }));
             return;
           }
           if (event === "subagents:rpc:spawn") {
             spawnRequests.push(data);
             queueMicrotask(() => {
-              dispatch(`${event}:reply:${data.requestId}`, { success: true, data: agentId });
+              dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { id: agentId } });
               setTimeout(() => {
                 if (opts.fail) {
                   dispatch("subagents:failed", { id: agentId, error: "agent exploded" });
@@ -1233,6 +1237,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
   }
 
   it("routes non-resident beats through the RPC runner when available", async () => {
+    mockResolveModel.mockReturnValue({ provider: "zai-coding-cn", id: "glm-5.3-flash" } as any);
     const pi = makeRpcPi();
     const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
     const storage = makeStorage([job]);
@@ -1243,7 +1248,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
 
     expect(mockRunSubagentOnce).not.toHaveBeenCalled();
     // The RPC host must receive the canonical model reference, not an alias.
-    expect(pi.spawnRequests[0]?.options?.model).toBe("haiku");
+    expect(pi.spawnRequests[0]?.options?.model).toBe("zai-coding-cn/glm-5.3-flash");
     expect(pi.spawnRequests[0]?.prompt).toContain("STATUS:");
     expect(storage.getJob(job.id).lastOutcome).toBe("ok");
     expect(storage.getJob(job.id).lastStatusLine).toBe("rpc ok");
@@ -1267,6 +1272,7 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
   });
 
   it("surfaces a failed RPC run through the error pipeline", async () => {
+    mockResolveModel.mockReturnValue({ provider: "zai-coding-cn", id: "glm-5.3-flash" } as any);
     const pi = makeRpcPi({ fail: true });
     const job = exampleJob({ model: "haiku", notifyOn: "anomaly", displayOn: "anomaly" });
     const storage = makeStorage([job]);
@@ -1277,5 +1283,166 @@ describe("CronScheduler — pi-subagents RPC runner", () => {
 
     expect(storage.getJob(job.id).lastOutcome).toBe("error");
     expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({ outcome: "error", error: "agent exploded" });
+  });
+});
+
+describe("CronScheduler — RPC client hardening (sol audit)", () => {
+  function busWithResponder(respond: (emit: (e: string, d: any) => void, event: string, data: any) => void) {
+    const handlers = new Map<string, ((data: any) => void)[]>();
+    const dispatch = (e: string, d: any) => {
+      for (const h of handlers.get(e) ?? []) h(d);
+    };
+    return {
+      events: {
+        on: (e: string, h: (d: any) => void) => {
+          const list = handlers.get(e) ?? [];
+          list.push(h);
+          handlers.set(e, list);
+          return () => handlers.set(e, (handlers.get(e) ?? []).filter((x) => x !== h));
+        },
+        emit: (e: string, d: any) => respond(dispatch, e, d),
+      } as any,
+    };
+  }
+
+  it("ready() requires the protocol version in the ping reply", async () => {
+    const { events } = busWithResponder((dispatch, event, data) => {
+      if (event === "subagents:rpc:ping") {
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 1 } }),
+        );
+      }
+    });
+    const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
+    const client = new SubagentsRpcClient(events);
+    expect(await client.ready()).toBe(false); // wrong version rejected
+    client.dispose();
+  });
+
+  it("retries a failed ping instead of caching it forever", async () => {
+    let pingCount = 0;
+    const { events } = busWithResponder((dispatch, event, data) => {
+      if (event === "subagents:rpc:ping") {
+        pingCount += 1;
+        if (pingCount === 1) return; // first probe: silence → timeout
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 2 } }),
+        );
+      }
+    });
+    const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
+    const client = new SubagentsRpcClient(events);
+    expect(await client.ready()).toBe(false);
+    client["lastFailedProbe"] = 0; // simulate cooldown expiry
+    expect(await client.ready()).toBe(true);
+    expect(pingCount).toBe(2);
+    client.dispose();
+  });
+
+  it("settles even when the terminal event fires BEFORE the spawn reply", async () => {
+    const { events } = busWithResponder((dispatch, event, data) => {
+      if (event === "subagents:rpc:ping") {
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 2 } }),
+        );
+        return;
+      }
+      if (event === "subagents:rpc:spawn") {
+        // Terminal event FIRST (buffered), then the spawn reply.
+        queueMicrotask(() => {
+          dispatch("subagents:completed", { id: "fast-agent", result: "STATUS: early ok" });
+          queueMicrotask(() =>
+            dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { id: "fast-agent" } }),
+          );
+        });
+        return;
+      }
+      dispatch(event, data);
+    });
+    const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
+    const client = new SubagentsRpcClient(events);
+    const result = await client.spawnAndWait({ prompt: "p" });
+    expect(result).toEqual({ ok: true, text: "STATUS: early ok" });
+    client.dispose();
+  });
+
+  it("fromEvent branches on the channel: failed-with-partial-result stays an error", async () => {
+    const { events } = busWithResponder((dispatch, event, data) => {
+      if (event === "subagents:rpc:ping") {
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 2 } }),
+        );
+        return;
+      }
+      if (event === "subagents:rpc:spawn") {
+        setTimeout(() => {
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { id: "x1" } });
+          setTimeout(() =>
+            dispatch("subagents:failed", { id: "x1", error: "boom", result: "partial output before crash" }), 5);
+        }, 2);
+        return;
+      }
+      dispatch(event, data);
+    });
+    const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
+    const client = new SubagentsRpcClient(events);
+    const result = await client.spawnAndWait({ prompt: "p" });
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toBe("boom");
+    client.dispose();
+  });
+
+  it("fromEvent branches on the channel: completed-empty-result stays a success", async () => {
+    const { events } = busWithResponder((dispatch, event, data) => {
+      if (event === "subagents:rpc:ping") {
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 2 } }),
+        );
+        return;
+      }
+      if (event === "subagents:rpc:spawn") {
+        setTimeout(() => {
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { id: "x2" } });
+          setTimeout(() => dispatch("subagents:completed", { id: "x2", result: "" }), 5);
+        }, 2);
+        return;
+      }
+      dispatch(event, data);
+    });
+    const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
+    const client = new SubagentsRpcClient(events);
+    const result = await client.spawnAndWait({ prompt: "p" });
+    expect(result).toEqual({ ok: true, text: "" });
+    client.dispose();
+  });
+
+  it("stops the host agent when the deadline aborts the run", async () => {
+    const stopped: string[] = [];
+    const { events } = busWithResponder((dispatch, event, data) => {
+      if (event === "subagents:rpc:ping") {
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { version: 2 } }),
+        );
+        return;
+      }
+      if (event === "subagents:rpc:spawn") {
+        queueMicrotask(() =>
+          dispatch(`${event}:reply:${data.requestId}`, { success: true, data: { id: "slow-agent" } }),
+        );
+        return; // never completes
+      }
+      if (event === "subagents:rpc:stop") {
+        stopped.push(data.agentId);
+        dispatch(`${event}:reply:${data.requestId}`, { success: true });
+        return;
+      }
+      dispatch(event, data);
+    });
+    const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
+    const client = new SubagentsRpcClient(events);
+    const result = await client.spawnAndWait({ prompt: "p" }, 30); // 30ms deadline
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("timed out");
+    client.dispose();
   });
 });
