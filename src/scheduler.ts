@@ -160,6 +160,10 @@ export class CronScheduler {
   private readonly ctx: ExtensionContext;
   private currentModel: ExtensionContext["model"];
   private readonly logBaseDir: string;
+  /** Wall-clock cap for one beat across ALL runners; overridable for tests. */
+  private readonly beatTimeoutMs: number;
+  /** Set by stop(): deferred resident creations must not resurrect. */
+  private stopped = false;
   /** Live resident sessions for jobs with resident=true. */
   private residentSessions = new Map<string, ResidentRecord>();
   /** Handoff summaries carried across resident resets (memory-bounded). */
@@ -167,7 +171,7 @@ export class CronScheduler {
   /** Default subagent runner: pi-subagents' cross-extension RPC, when present. */
   private readonly subagentsRpc: SubagentsRpcClient;
 
-  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext, logBaseDir?: string) {
+  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext, logBaseDir?: string, beatTimeoutMs?: number) {
     this.storage = storage;
     this.pi = pi;
     this.ctx = ctx;
@@ -175,6 +179,7 @@ export class CronScheduler {
     // Overridable for tests; defaults into the plugin-owned agent dir so
     // quiet-run archives never land inside the user's project tree.
     this.logBaseDir = logBaseDir ?? path.join(getAgentDir(), "schedule-logs");
+    this.beatTimeoutMs = beatTimeoutMs ?? BEAT_TIMEOUT_MS;
     this.subagentsRpc = new SubagentsRpcClient(pi.events);
   }
 
@@ -218,6 +223,7 @@ export class CronScheduler {
    * Stop all scheduled jobs
    */
   stop(): void {
+    this.stopped = true;
     // Abort any in-flight subagent runs so they don't keep streaming or post
     // markers against a stale pi reference after session shutdown.
     for (const controller of this.activeSubagents) {
@@ -269,18 +275,21 @@ export class CronScheduler {
   /**
    * Update a job (reschedule if needed)
    */
-  updateJob(id: string, updated: CronJob): void {
+  updateJob(id: string, updated: CronJob, previous?: CronJob): void {
     // Configuration changes invalidate a resident session's memory — dispose
     // so the next beat starts fresh (with a handoff) under the new config.
-    const previous = this.storage.getJob(id);
+    // Callers that persist to storage BEFORE calling here must pass the
+    // PRE-update snapshot as `previous` (the tool does); reading storage
+    // then would compare the updated config against itself.
+    const prev = previous ?? this.storage.getJob(id);
     if (
-      previous &&
-      (previous.model !== updated.model ||
-        previous.prompt !== updated.prompt ||
-        previous.resident !== updated.resident ||
-        previous.contextNote !== updated.contextNote ||
-        JSON.stringify(previous.extensions) !== JSON.stringify(updated.extensions) ||
-        JSON.stringify(previous.skills) !== JSON.stringify(updated.skills))
+      prev &&
+      (prev.model !== updated.model ||
+        prev.prompt !== updated.prompt ||
+        prev.resident !== updated.resident ||
+        prev.contextNote !== updated.contextNote ||
+        JSON.stringify(prev.extensions) !== JSON.stringify(updated.extensions) ||
+        JSON.stringify(prev.skills) !== JSON.stringify(updated.skills))
     ) {
       this.disposeResident(id);
     }
@@ -525,6 +534,19 @@ export class CronScheduler {
     });
     if (!created.ok) return created;
 
+    // Lifecycle guard: the job may have been removed, made non-resident, or
+    // the scheduler stopped while creation was in flight — never resurrect
+    // an orphan session over a fresh decision.
+    const still = this.stopped ? undefined : this.storage.getJob(job.id);
+    if (this.stopped || !still?.model || !still.resident || this.residentSessions.has(job.id)) {
+      try {
+        created.handle.session.abort();
+      } catch {
+        // best-effort
+      }
+      return { ok: false, error: "job configuration changed during session creation" };
+    }
+
     const handoff = this.residentHandoffs.get(job.id);
     this.residentHandoffs.delete(job.id);
     const seed = this.buildResidentSeed(job, handoff);
@@ -588,9 +610,19 @@ export class CronScheduler {
     try {
       const resident = await this.getOrCreateResident(job);
       if (!resident.ok) return { ok: false, error: resident.error };
-      const result = await promptSubagentSession(resident.record.handle.session, question);
+      // First contact before any beat: deliver the seed (parent digest +
+      // contextNote + any reset handoff) so ad-hoc questions get full context.
+      const askPrompt = resident.seed
+        ? `${resident.seed}\n\n--- Ad-hoc question (scheduled beats follow later):\n${question}`
+        : question;
+      let result: SubagentResult;
+      try {
+        result = await promptSubagentSession(resident.record.handle.session, askPrompt);
+      } catch (err) {
+        result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
       resident.record.estChars +=
-        question.length + (result.ok ? result.text.length : result.error.length);
+        askPrompt.length + (result.ok ? result.text.length : result.error.length);
       archiveRun(this.logBaseDir, this.ctx.cwd, job.id, {
         ts: new Date().toISOString(),
         outcome: result.ok ? "ok" : "error",
@@ -706,6 +738,13 @@ export class CronScheduler {
 
     const controller = new AbortController();
     this.activeSubagents.add(controller);
+    // One wall-clock deadline for EVERY runner (RPC, resident, in-process
+    // fallback): a hung prompt must not pin activeJobs and block later beats.
+    let beatTimedOut = false;
+    const beatDeadline = setTimeout(() => {
+      beatTimedOut = true;
+      controller.abort();
+    }, this.beatTimeoutMs);
 
     try {
       let result: SubagentResult;
@@ -714,15 +753,25 @@ export class CronScheduler {
           const resident = await this.getOrCreateResident(job);
           if (!resident.ok) {
             result = { ok: false, error: resident.error };
+          } else if (controller.signal.aborted) {
+            // Shutdown/removal won while the session was being created.
+            this.disposeResident(job.id);
+            result = { ok: false, error: "beat cancelled during session creation" };
           } else {
             const beatPrompt = resident.seed
               ? `${resident.seed}\n\n--- Scheduled beat prompt (this and later messages are recurring beats):\n${job.prompt}${STATUS_CONVENTION}`
               : `${job.prompt}${STATUS_CONVENTION}`;
-            result = await promptSubagentSession(
-              resident.record.handle.session,
-              beatPrompt,
-              controller.signal,
-            );
+            try {
+              result = await promptSubagentSession(
+                resident.record.handle.session,
+                beatPrompt,
+                controller.signal,
+              );
+            } catch (err) {
+              // A thrown prompt must reach the failure pipeline — otherwise
+              // lastStatus sticks on "running" forever.
+              result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+            }
             resident.record.beats += 1;
             resident.record.estChars +=
               beatPrompt.length + (result.ok ? result.text.length : result.error.length);
@@ -760,7 +809,7 @@ export class CronScheduler {
                 model,
                 isBackground: true,
               },
-              BEAT_TIMEOUT_MS,
+              this.beatTimeoutMs,
               controller.signal,
             );
           }
@@ -786,7 +835,15 @@ export class CronScheduler {
 
       // Scheduler was stopped (session shutdown / switch / fork) while we were
       // running. Don't touch storage or post markers — pi may be invalidated.
-      if (controller.signal.aborted) return;
+      // A TIMEOUT abort is different: it must record a terminal error instead
+      // of leaving lastStatus stuck on "running".
+      if (controller.signal.aborted && !beatTimedOut) return;
+      if (beatTimedOut) {
+        result = { ok: false, error: `beat timed out after ${Math.round(this.beatTimeoutMs / 60000)}m` };
+        // An aborted resident prompt leaves the session in an uncertain
+        // state — dispose rather than reuse it for the next beat.
+        if (job.resident) this.disposeResident(job.id);
+      }
 
       // The job may have been removed while the beat ran — never write
       // completion state or post markers for a dead job.
@@ -961,6 +1018,8 @@ export class CronScheduler {
     } catch (error) {
       // Backstop: storage or marker failures must not become unhandled rejections.
       console.error(`Subagent completion handler failed for job ${job.id}:`, error);
+    } finally {
+      clearTimeout(beatDeadline);
     }
   }
 

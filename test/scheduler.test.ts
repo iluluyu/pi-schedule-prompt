@@ -1333,7 +1333,7 @@ describe("CronScheduler — RPC client hardening (sol audit)", () => {
     const { SubagentsRpcClient } = await import("../src/subagents-rpc.js");
     const client = new SubagentsRpcClient(events);
     expect(await client.ready()).toBe(false);
-    client["lastFailedProbe"] = 0; // simulate cooldown expiry
+    (client as any).lastFailedProbe = 0; // simulate cooldown expiry
     expect(await client.ready()).toBe(true);
     expect(pingCount).toBe(2);
     client.dispose();
@@ -1444,5 +1444,115 @@ describe("CronScheduler — RPC client hardening (sol audit)", () => {
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.error).toContain("timed out");
     client.dispose();
+  });
+});
+
+describe("CronScheduler — sol final-review fixes", () => {
+  beforeEach(() => {
+    mockRunSubagentOnce.mockReset();
+    mockArchiveRun.mockReset();
+    mockCreateSubagentSession.mockReset();
+    mockPromptSubagentSession.mockReset();
+    mockResolveModel.mockReset();
+  });
+
+  const fakeSession = () => ({ abort: vi.fn(), prompt: vi.fn(), messages: [] });
+  const okHandle = (session: any) => ({
+    session,
+    model: {} as any,
+    modelRef: "zai-coding-cn/glm-5.3-flash",
+    requestedModel: "fast",
+  });
+
+  it("a thrown resident prompt reaches the failure pipeline (no stuck running)", async () => {
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(fakeSession()) as any });
+    mockPromptSubagentSession.mockRejectedValue(new Error("session exploded"));
+    const job = exampleJob({ type: "cron", schedule: "0 * * * * *", model: "fast", resident: true });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("error"));
+    expect(storage.getJob(job.id).lastOutcome).toBe("error");
+    expect(mockArchiveRun.mock.calls[0][3]).toMatchObject({ outcome: "error", error: "session exploded" });
+  });
+
+  it("updateJob disposes a resident session when passed an explicit pre-update snapshot", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "STATUS: ok" });
+    const job = exampleJob({ type: "cron", schedule: "0 * * * * *", model: "fast", resident: true });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("success"));
+
+    // Tool ordering: storage is persisted FIRST — without the explicit
+    // `previous` snapshot the scheduler would compare the job against itself.
+    // The snapshot must be taken BEFORE persisting (makeStorage mutates the
+    // stored object in place, so `job` itself would reflect the update).
+    const previous = { ...job };
+    const updated = { ...job, prompt: "new prompt" };
+    storage.updateJob(job.id, { prompt: "new prompt" });
+    scheduler.updateJob(job.id, updated, previous);
+    expect(session.abort).toHaveBeenCalled();
+    expect((scheduler as any).residentSessions.size).toBe(0);
+  });
+
+  it("removal during resident creation never resurrects an orphan session", async () => {
+    let resolveCreation: (v: any) => void = () => {};
+    mockCreateSubagentSession.mockImplementation(
+      () => new Promise((resolve) => { resolveCreation = resolve; }),
+    );
+    const session = fakeSession();
+    const job = exampleJob({ type: "cron", schedule: "0 * * * * *", model: "fast", resident: true });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx());
+
+    const pending = (scheduler as any).executeJobInSubagent(job);
+    storage.removeJob(job.id); // removed while creation is in flight
+    resolveCreation({ ok: true, handle: okHandle(session) as any });
+    await pending;
+
+    expect(session.abort).toHaveBeenCalled(); // stale handle disposed
+    expect(mockPromptSubagentSession).not.toHaveBeenCalled(); // no prompt started
+    expect((scheduler as any).residentSessions.size).toBe(0); // nothing resurrected
+  });
+
+  it("a hung beat hits the wall-clock deadline and records a terminal error", async () => {
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(fakeSession()) as any });
+    // Hangs until aborted — the real promptSubagentSession unblocks the same
+    // way when its abort signal fires (session.abort rejects session.prompt).
+    mockPromptSubagentSession.mockImplementation(
+      (_session: any, _prompt: string, signal?: AbortSignal) =>
+        new Promise((resolve) => {
+          signal?.addEventListener("abort", () => resolve({ ok: false, error: "aborted" }), { once: true });
+        }),
+    );
+    const job = exampleJob({ type: "cron", schedule: "0 * * * * *", model: "fast", resident: true });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, makePi(), makeCtx(), "/tmp/rl", 40); // 40ms cap
+
+    await (scheduler as any).executeJobInSubagent(job);
+    await vi.waitFor(() => expect(storage.getJob(job.id).lastStatus).toBe("error"), { timeout: 3000 });
+    expect(storage.getJob(job.id).lastOutcome).toBe("error");
+    // The aborted resident session must not be reused.
+    expect((scheduler as any).residentSessions.size).toBe(0);
+  });
+
+  it("ask before the first beat delivers the seed (digest + contextNote + handoff)", async () => {
+    const session = fakeSession();
+    mockCreateSubagentSession.mockResolvedValue({ ok: true, handle: okHandle(session) as any });
+    mockPromptSubagentSession.mockResolvedValue({ ok: true, text: "seeded answer" });
+    const job = exampleJob({ type: "cron", schedule: "0 * * * * *", model: "fast", resident: true, contextNote: "arms A/B" });
+    const scheduler = new CronScheduler(makeStorage([job]), makePi(), makeCtx());
+
+    const answer = await scheduler.askResident(job.id, "status?");
+    expect(answer).toEqual({ ok: true, text: "seeded answer" });
+    const prompt = mockPromptSubagentSession.mock.calls[0][1] as string;
+    expect(prompt).toContain("persistent background heartbeat agent");
+    expect(prompt).toContain("arms A/B");
+    expect(prompt).toContain("status?");
   });
 });

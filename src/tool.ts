@@ -198,7 +198,7 @@ export function createCronTool(
             const enabled = action === "enable";
             storage.updateJob(params.jobId, { enabled });
             const updated = { ...job, enabled };
-            scheduler.updateJob(params.jobId, updated);
+            scheduler.updateJob(params.jobId, updated, job);
 
             details.jobs = [updated];
             details.jobId = params.jobId;
@@ -305,7 +305,9 @@ export function createCronTool(
 
             storage.updateJob(params.jobId, updates);
             const updated = { ...job, ...updates };
-            scheduler.updateJob(params.jobId, updated);
+            // Pass the PRE-update snapshot: storage already holds `updated`,
+            // so the scheduler cannot reconstruct the previous config itself.
+            scheduler.updateJob(params.jobId, updated, job);
 
             details.jobs = [updated];
             details.jobId = params.jobId;

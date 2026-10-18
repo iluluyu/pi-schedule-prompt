@@ -44,7 +44,8 @@ export type SpawnResult = { ok: true; agentId: string } | { ok: false; error: st
 export type RunResult = { ok: true; text: string } | { ok: false; error: string };
 
 interface RpcEventBus {
-  on(event: string, handler: (data: unknown) => void): (() => void) | void;
+  /** Returns the unsubscribe function (defensive call sites use `off?.()`). */
+  on(event: string, handler: (data: unknown) => void): () => void;
   emit(event: string, data: unknown): void;
 }
 
@@ -166,6 +167,22 @@ export class SubagentsRpcClient {
     return { ok: true, agentId };
   }
 
+  /** Ask the host's registry to forget a finished agent. The current
+   *  registry entry (waitForAll/hasRunning/spawn/getRecord) has no removal
+   *  method — finished records are evicted ~10 minutes after completion by
+   *  the host's own 60s sweep — but calling a `forget` hook if one ever
+   *  appears makes cleanup immediate at zero cost today. */
+  private forget(agentId: string): void {
+    try {
+      const entry = (globalThis as Record<symbol, { forget?: (id: string) => void } | undefined>)[
+        Symbol.for("pi-subagents:manager")
+      ];
+      entry?.forget?.(agentId);
+    } catch {
+      // best-effort, future-proof
+    }
+  }
+
   /** Suppress the host's own completion notification for an agent we already
    *  consumed the result of. Synchronous side effect on emit — by design. */
   consume(agentId: string): void {
@@ -212,6 +229,7 @@ export class SubagentsRpcClient {
       if (agentId) {
         this.stop(agentId);
         this.consume(agentId);
+        this.forget(agentId);
       }
     });
 
@@ -234,6 +252,7 @@ export class SubagentsRpcClient {
       };
       const fromEvent = (e: AgentLifecycleEvent, failed: boolean): RunResult => {
         this.consume(e.id as string);
+        this.forget(e.id as string);
         // Branch on the channel, never on result emptiness: a failed run can
         // carry partial result text, and a successful run can reply "".
         if (failed) {
@@ -280,6 +299,7 @@ export class SubagentsRpcClient {
           if (ctl.signal.aborted) {
             this.stop(agentId);
             this.consume(agentId);
+            this.forget(agentId);
             settle({
               ok: false,
               error: timedOut ? `beat timed out after ${runTimeoutMs}ms` : "beat cancelled",

@@ -20,6 +20,9 @@ const WIDGET_ID = "schedule-prompts";
  *  legacy `widgetVisible: false` setting (see settings.ts). */
 export type WidgetStyle = "compact" | "table" | "hidden";
 
+/** Cap on entries shown in the compact one-liner; overflow is hidden. */
+const MAX_COMPACT_JOBS = 5;
+
 /** Strip ANSI escapes and control characters from a status line before it is
  *  embedded in the compact widget — subagent output is untrusted text. */
 function sanitizeStatusLine(line: string): string {
@@ -172,44 +175,45 @@ export class CronWidget {
     return this.getStyle() === "table" ? this.renderTable(width, theme) : this.renderCompact(width, theme);
   }
 
-  /** Compact style: one borderless status line. Entries sorted by urgency,
-   *  joined with " · ", truncated to the render width; entries dropped for
-   *  width are counted in a trailing " +N". */
+  /** Compact style: one borderless status line. At most MAX_COMPACT_JOBS
+   *  entries — highest urgency first — share the width EQUALLY; each entry
+   *  compresses internally (identity > progress > next-run) instead of whole
+   *  jobs being dropped, and overflow beyond the cap is simply not shown
+   *  (the table style remains the full view). */
   private renderCompact(width: number, theme: any): string[] {
-    const entries = this.uniqueJobs()
-      .slice()
-      .sort((a, b) => compactRank(a) - compactRank(b))
-      .map((job) => this.compactEntry(job, theme));
-
+    const jobs = this.uniqueJobs().slice().sort((a, b) => compactRank(a) - compactRank(b));
     const prefix = `${theme.fg("error", "♥")} `;
     const separator = " · ";
-    let line = prefix;
-    let used = visibleWidth(prefix);
-    let dropped = 0;
+    const sepWidth = visibleWidth(separator);
 
-    for (let i = 0; i < entries.length; i++) {
-      const chunk = (i === 0 ? "" : separator) + entries[i];
-      const chunkWidth = visibleWidth(chunk);
-      if (used + chunkWidth > width) {
-        dropped = entries.length - i;
-        break;
-      }
-      line += chunk;
-      used += chunkWidth;
-    }
+    const shown = jobs.slice(0, Math.min(jobs.length, MAX_COMPACT_JOBS));
+    const usable = Math.max(0, width - visibleWidth(prefix) - sepWidth * Math.max(0, shown.length - 1));
+    const share = shown.length > 0 ? Math.floor(usable / shown.length) : usable;
 
-    if (dropped > 0) {
-      const suffix = line.endsWith(" ") ? `+${dropped}` : ` +${dropped}`;
-      const suffixWidth = visibleWidth(suffix);
-      if (used + suffixWidth > width) {
-        line = truncateToWidth(line, Math.max(0, width - suffixWidth), "") + suffix;
-      } else {
-        line += suffix;
-      }
-    }
+    const parts = shown.map((job) => this.compactEntryFit(job, theme, Math.max(1, share)));
+    const line = prefix + parts.join(separator);
 
     // Final width safety (e.g. degenerate widths smaller than the prefix).
     return [truncateToWidth(line, width, "")];
+  }
+
+  /** One compact entry compressed to `share` columns: identity (icon+name)
+   *  survives longest, then the progress detail; the next-run tail is the
+   *  first thing dropped under pressure. */
+  private compactEntryFit(job: CronJob, theme: any, share: number): string {
+    const full = this.compactEntry(job, theme);
+    if (visibleWidth(full) <= share) return full;
+
+    const icon = statusIconFor(job, theme);
+    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
+    const head = `${icon} ${name}`;
+    const headWidth = visibleWidth(head);
+    if (headWidth + 1 >= share) {
+      return truncateToWidth(full, Math.max(1, share), "…");
+    }
+    const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
+    const room = share - headWidth - 1;
+    return `${head} ${theme.fg("dim", truncateToWidth(detailRaw, room, "…"))}`;
   }
 
   /** One compact entry: `icon name` + dim status line (or humanized schedule)

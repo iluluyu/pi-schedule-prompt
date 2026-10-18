@@ -121,7 +121,7 @@ export class JobsView implements Component {
       if (this.isSelectionForeign()) return;
       const enabled = !sel.enabled;
       this.storage.updateJob(sel.id, { enabled });
-      this.scheduler.updateJob(sel.id, { ...sel, enabled });
+      this.scheduler.updateJob(sel.id, { ...sel, enabled }, sel);
       this.refresh();
       return;
     }
@@ -132,7 +132,7 @@ export class JobsView implements Component {
       if (this.isSelectionForeign()) return;
       const session = sel.session ? undefined : this.mySessionId;
       this.storage.updateJob(sel.id, { session });
-      this.scheduler.updateJob(sel.id, { ...sel, session });
+      this.scheduler.updateJob(sel.id, { ...sel, session }, sel);
       this.refresh();
       return;
     }

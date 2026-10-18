@@ -196,23 +196,46 @@ describe("CronWidget — compact style", () => {
     expect(lines[0]).toContain("·");
   });
 
-  it("drops entries that do not fit and ends with +N within the width", () => {
+  it("compresses every entry horizontally before folding any into +N", () => {
     const mk = (id: string, name: string, status: string) =>
       exampleJob({ id, name, lastStatusLine: status });
     const jobs = [
-      mk("1", "first-job-with-long-name", "step 3/10 done"),
-      mk("2", "second-job-with-long-name", "step 7/10 done"),
-      mk("3", "third-job-with-long-name", "step 9/10 done"),
-      mk("4", "fourth-job-with-long-name", "waiting"),
+      mk("1", "first-job", "step 3/10 done and trending stable"),
+      mk("2", "second-job", "step 7/10 done and trending stable"),
+      mk("3", "third-job", "step 9/10 done and trending stable"),
     ];
 
-    const lines = renderCompact(jobs, { width: 60 });
-    expect(lines).toHaveLength(1);
-    const line = lines[0];
+    // Generous width: all three jobs share one line, none dropped.
+    const wide = renderCompact(jobs, { width: 140 });
+    expect(wide).toHaveLength(1);
+    expect(wide[0]).toContain("first-job");
+    expect(wide[0]).toContain("second-job");
+    expect(wide[0]).toContain("third-job");
+    expect(wide[0]).not.toMatch(/\+\d+$/);
+
+    // Tight width: entries compress per-share, nothing folds into +N.
+    const tight = renderCompact([...jobs, mk("4", "fourth-job", "waiting")], { width: 60 });
+    expect(tight).toHaveLength(1);
+    const line = tight[0];
     expect(visibleWidth(line)).toBeLessThanOrEqual(60);
     expect(line).toContain("first-job");
-    expect(line).not.toContain("second-job");
-    expect(line).toMatch(/\+\d+$/);
+    // 4 jobs x ~15 cols each needs more than 60 — names compress mid-way,
+    // which is the point: every job keeps a fragment, none is dropped.
+    expect(line).toContain("second-jo");
+    expect(line).toContain("third-jo");
+    expect(line).toContain("fourth-jo");
+    expect(line).not.toMatch(/\+\d+$/);
+  });
+
+  it("caps the compact line at 5 jobs — overflow is hidden, not shown", () => {
+    const mk = (id: string, name: string) => exampleJob({ id, name, lastStatusLine: "ok" });
+    const jobs = [mk("1", "j-one"), mk("2", "j-two"), mk("3", "j-three"), mk("4", "j-four"), mk("5", "j-five"), mk("6", "j-six"), mk("7", "j-seven")];
+    const lines = renderCompact(jobs, { width: 200 });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("j-five");
+    expect(lines[0]).not.toContain("j-six");
+    expect(lines[0]).not.toContain("j-seven");
+    expect(lines[0]).not.toMatch(/\+\d+$/);
   });
 
   it("keeps the line within width even for degenerate narrow widths", () => {

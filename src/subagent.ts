@@ -262,14 +262,20 @@ export async function promptSubagentSession(
   prompt: string,
   signal?: AbortSignal,
 ): Promise<SubagentResult> {
+  // An already-aborted signal must NOT start a prompt — aborting an idle
+  // session and prompting anyway resurrects work the caller cancelled.
+  if (signal?.aborted) {
+    try {
+      session.abort();
+    } catch {
+      // best-effort
+    }
+    return { ok: false, error: "aborted before prompt" };
+  }
   let onAbort: (() => void) | undefined;
   if (signal) {
-    if (signal.aborted) {
-      session.abort();
-    } else {
-      onAbort = () => session.abort();
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
+    onAbort = () => session.abort();
+    signal.addEventListener("abort", onAbort, { once: true });
   }
 
   let buffered = "";
