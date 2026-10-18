@@ -264,6 +264,18 @@ describe("CronWidget — compact style", () => {
     expect((lines[0].match(/▫/g) ?? []).length).toBe(3); // hollow track cells
   });
 
+  it("fills the bar from creation when the first beat has not run yet", () => {
+    const job = exampleJob({ id: "1", name: "fresh", lastStatusLine: "ok", intervalMs: 600000 });
+    const lines = renderCompact([job], {
+      width: 100,
+      periodMs: 600000,
+      nextRun: new Date(Date.now() + 9 * 60_000), // 9m remaining of a 10m period
+    });
+    expect(lines[0]).toContain("10m");
+    expect((lines[0].match(/▪/g) ?? []).length).toBe(1); // ~10% elapsed -> 1 filled cell
+    expect((lines[0].match(/▫/g) ?? []).length).toBe(4);
+  });
+
   it("caps the compact line at 5 jobs — overflow is hidden, not shown", () => {
     const mk = (id: string, name: string) => exampleJob({ id, name, lastStatusLine: "ok" });
     const jobs = [mk("1", "j-one"), mk("2", "j-two"), mk("3", "j-three"), mk("4", "j-four"), mk("5", "j-five"), mk("6", "j-six"), mk("7", "j-seven")];

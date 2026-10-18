@@ -273,8 +273,15 @@ export class CronWidget {
       // (resets each fire) + the total, e.g. "▪▪▫▫▫ 30s".
       const elapsed = Math.max(0, Date.now() - lastMs);
       parts.push(`${progressBar(elapsed, period, theme)} ${compactToken(period)}`);
+    } else if (period && nextRun) {
+      // Before the first beat (no lastRun yet): derive elapsed from the
+      // countdown — the bar starts filling from job creation instead of
+      // showing a bare remaining/total countdown.
+      const remaining = Math.max(0, nextRun.getTime() - Date.now());
+      const elapsed = Math.max(0, Math.min(period, period - remaining));
+      parts.push(`${progressBar(elapsed, period, theme)} ${compactToken(period)}`);
     } else if (nextRun) {
-      parts.push(formatRelativeTime(nextRun, period));
+      parts.push(formatRelativeTime(nextRun));
     }
     return parts.join(" ");
   }
