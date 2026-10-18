@@ -152,6 +152,9 @@ interface ResidentRecord {
  */
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
+  /** Next-fire timestamps for interval jobs (setInterval exposes none,
+   *  so we track them ourselves for getNextRun / the widget countdown). */
+  private readonly intervalNextAt = new Map<string, number>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private activeSubagents = new Set<AbortController>();
   private activeJobs = new Set<string>();
@@ -309,7 +312,9 @@ export class CronScheduler {
       const next = cron.nextRun();
       return next || null;
     }
-    return null;
+    // Interval jobs have no croner entry — use the tracked next-fire time.
+    const at = this.intervalNextAt.get(jobId);
+    return at ? new Date(at) : null;
   }
 
   /**
@@ -319,10 +324,13 @@ export class CronScheduler {
     try {
       if (job.type === "interval" && job.intervalMs) {
         // Interval-based scheduling
+        const intervalMs = job.intervalMs;
         const interval = setInterval(() => {
+          this.intervalNextAt.set(job.id, Date.now() + intervalMs);
           this.executeJob(job);
-        }, job.intervalMs);
+        }, intervalMs);
         this.intervals.set(job.id, interval);
+        this.intervalNextAt.set(job.id, Date.now() + intervalMs);
       } else if (job.type === "once") {
         // One-shot execution at a specific time
         const targetDate = new Date(job.schedule);
@@ -382,6 +390,7 @@ export class CronScheduler {
     if (interval) {
       clearInterval(interval);
       this.intervals.delete(id);
+      this.intervalNextAt.delete(id);
     }
   }
 

@@ -11,13 +11,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
+import { readRuns } from "./run-log.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
 import { CronStorage } from "./storage.js";
 import { createCronTool } from "./tool.js";
+import type { CronJob } from "./types.js";
 import { runAddFlow } from "./ui/add-flow.js";
 import { CronWidget } from "./ui/cron-widget.js";
 import { JobsView } from "./ui/jobs-view.js";
+import { PeekView } from "./ui/peek-view.js";
 
 export default async function (pi: ExtensionAPI) {
   let storage: CronStorage;
@@ -168,15 +171,36 @@ export default async function (pi: ExtensionAPI) {
           // Hide the Jobs overlay while the add flow's dialogs are open —
           // otherwise it sits on top of them and steals input.
           let jobsOverlay: OverlayHandle | undefined;
-          const wrappedRunAdd = async () => {
+          const hideJobsDuring = async (flow: () => Promise<void>) => {
             jobsOverlay?.setHidden(true);
             try {
-              await runAddFlow(ctx, storage, scheduler, settings, mySessionId);
+              await flow();
             } finally {
               jobsOverlay?.setHidden(false);
               jobsOverlay?.focus();
             }
           };
+          const wrappedRunAdd = () =>
+            hideJobsDuring(() => runAddFlow(ctx, storage, scheduler, settings, mySessionId));
+          // Peek: read-only overlay over the job's archived runs. It never
+          // enters the agent session — live conversation/steering stays in
+          // pi-subagents' /agents, which is itself an overlay, not a switch.
+          const wrappedRunPeek = (job: CronJob) =>
+            hideJobsDuring(() =>
+              ctx.ui.custom<void>(
+                (_tui, theme, _kb, done) =>
+                  new PeekView(
+                    theme,
+                    job.name,
+                    readRuns(scheduler.getRunLogBaseDir(), ctx.cwd ?? process.cwd(), job.id, 12),
+                    () => done(undefined),
+                  ),
+                {
+                  overlay: true,
+                  overlayOptions: { width: "100%", maxHeight: "100%" },
+                },
+              ),
+            );
           await ctx.ui.custom<void>(
             (tui, theme, _kb, done) =>
               new JobsView(
@@ -184,6 +208,7 @@ export default async function (pi: ExtensionAPI) {
                 scheduler,
                 mySessionId,
                 wrappedRunAdd,
+                wrappedRunPeek,
                 theme,
                 () => tui.requestRender(),
                 () => done(undefined),

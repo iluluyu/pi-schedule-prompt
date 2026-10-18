@@ -33,6 +33,7 @@ export class JobsView implements Component {
     private scheduler: CronScheduler,
     private mySessionId: string | undefined,
     private runAdd: () => Promise<void>,
+    private runPeek: (job: CronJob) => Promise<void>,
     private theme: any,
     private requestRender: () => void,
     private done: () => void,
@@ -117,6 +118,16 @@ export class JobsView implements Component {
     const sel = this.selectedJob();
     if (!sel) return;
 
+    if (matchesKey(data, "p")) {
+      // Peek is read-only (archived runs), so foreign-session jobs may peek too.
+      this.runPeek(sel)
+        .catch((err) => console.error("[pi-schedule-prompt] peek failed:", err))
+        .finally(() => {
+          this.refresh();
+          this.requestRender();
+        });
+      return;
+    }
     if (matchesKey(data, "t")) {
       if (this.isSelectionForeign()) return;
       const enabled = !sel.enabled;
@@ -169,7 +180,7 @@ export class JobsView implements Component {
       lines.push(` ${this.theme.fg("accent", this.theme.bold("Jobs"))}  —  a add   q quit`);
     } else {
       lines.push(
-        ` ${this.theme.fg("accent", this.theme.bold("Jobs"))}  —  ↑↓ select   a add   t toggle   s scope   x remove   c cleanup   q quit`,
+        ` ${this.theme.fg("accent", this.theme.bold("Jobs"))}  —  ↑↓ select   a add   p peek   t toggle   s scope   x remove   c cleanup   q quit`,
       );
     }
     lines.push(rule);
