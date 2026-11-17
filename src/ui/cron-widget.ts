@@ -1,9 +1,9 @@
 /**
  * CronWidget — displays scheduled prompts above the editor
  *
- * Two styles: "compact" (default; one borderless status line with name,
- * state, last STATUS: line and next run) and "table" (bordered job details).
- * "hidden" mounts nothing. Relative times refresh every second.
+ * Two styles: "compact" (default; one borderless status line with status
+ * icon, name, last STATUS: line and next run) and "table" (bordered job
+ * details). "hidden" mounts nothing. Relative times refresh every second.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -178,7 +178,7 @@ export class CronWidget {
    *  The table style remains available for the full job list. */
   private renderCompact(width: number, theme: any): string[] {
     const jobs = this.uniqueJobs().slice().sort((a, b) => compactRank(a) - compactRank(b));
-    const prefix = `${theme.fg("dim", "heartbeat")} `;
+    const prefix = "";
     const baseSeparator = " · ";
     const sepWidth = visibleWidth(baseSeparator);
 

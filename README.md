@@ -34,7 +34,7 @@ schedule_prompt action=add type=interval schedule=15m model=fast   notifyOn=anom
 What you get:
 
 - **Zero chat / zero parent-context cost** while healthy — no start markers, no snippets
-- The widget line above the editor: `heartbeat ● gpu-watch gpu 8.1/12GiB ok ▰▰▱▱▱ 8m/15m`
+- The widget line above the editor: `● gpu-watch gpu 8.1/12GiB ok ▰▰▱▱▱ 8m/15m`
 - Every beat is a real agent in `/agents` — scroll its dialogue, steer it live
 - `schedule_prompt action=logs` (or `p` in `/schedule-prompt → Jobs`) reads archived runs
 - On `ALERT`: the parent wakes with the full output; a persistent anomaly re-wakes only every 4th beat; recovery posts a display-only marker
@@ -231,7 +231,7 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 
 **Widget:**
 
-- Three styles via `/schedule-prompt → Settings → Widget style` (persisted like other settings): **compact** (default — one borderless line above the editor, e.g. `heartbeat ● local 10.2M/20.5M ▰▰▱▱▱ 12m/30m`, anomalous/error/running jobs first, up to five entries), **table** (the classic bordered per-job table), **hidden**. Legacy `widgetVisible: false` settings migrate to `hidden`
+- Three styles via `/schedule-prompt → Settings → Widget style` (persisted like other settings): **compact** (default — one borderless line above the editor, e.g. `● local 10.2M/20.5M ▰▰▱▱▱ 12m/30m`, anomalous/error/running jobs first, up to five entries), **table** (the classic bordered per-job table), **hidden**. Legacy `widgetVisible: false` settings migrate to `hidden`
 - Auto-hides when no jobs configured
 - Table mode shows: status icon, name, schedule (human-readable), prompt (truncated), next run, last run, run count
 - Human-readable formatting: "every minute", "daily", "Feb 13 15:30" instead of raw cron/ISO
@@ -318,7 +318,7 @@ Finished beat agents are evicted from `/agents` automatically about 10 minutes a
 **Progress convention (`STATUS:`).** Every subagent beat prompt gets a one-line suffix asking the agent to make the **first line** of its reply exactly `STATUS: <one-line plain-text progress summary>`. The scheduler extracts that line (first non-empty line only — a `STATUS:` quoted deeper in the output does not count), strips terminal escape sequences, caps it at 240 chars, and persists it as the job's `lastStatusLine`. The compact widget renders it as a live progress readout:
 
 ```
-heartbeat ● local 10.2M/20.5M shots · gpu 4.7GiB · eta 17:30 ▰▰▱▱▱ 12m/30m
+● local 10.2M/20.5M shots · gpu 4.7GiB · eta 17:30 ▰▰▱▱▱ 12m/30m
 ```
 
 Use `stopOn` for lifecycle completion instead of asking the background subagent to call `schedule_prompt`: scheduled subagents intentionally do not load extensions by default, so they cannot reliably remove their own parent job. For example, set `stopOn="DRIVER_DONE"` and make the prompt emit that literal marker only after final verification.

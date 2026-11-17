@@ -145,8 +145,8 @@ describe("CronWidget — compact style", () => {
 
     expect(lines).toHaveLength(1);
     const line = lines[0];
-    expect(line).toContain("heartbeat");
     expect(line).toContain("●");
+    expect(line).not.toContain("heartbeat");
     expect(line).not.toContain("◆");
     expect(line).toContain("health");
     expect(line).toContain("STATUS: all good");
@@ -247,7 +247,7 @@ describe("CronWidget — compact style", () => {
   it("keeps separators compact even when the terminal is wide", () => {
     const a = exampleJob({ id: "1", name: "one", lastStatusLine: "s1" });
     const b = exampleJob({ id: "2", name: "two", lastStatusLine: "s2" });
-    expect(renderCompact([a, b], { width: 400 })[0]).toBe("heartbeat ● one s1 · ● two s2");
+    expect(renderCompact([a, b], { width: 400 })[0]).toBe("● one s1 · ● two s2");
   });
 
   it("compresses status text before the countdown under width pressure", () => {
