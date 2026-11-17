@@ -1,10 +1,9 @@
 /**
- * CronWidget — displays scheduled prompts below the editor
+ * CronWidget — displays scheduled prompts above the editor
  *
- * Two styles: "compact" (default; one borderless status line: icon, name,
- * last STATUS: line, next run) and "table" (bordered table with status, name,
- * schedule, next run, last run, and run count). "hidden" mounts nothing.
- * Auto-refreshes every 30 seconds to update relative times
+ * Two styles: "compact" (default; one borderless status line with name,
+ * state, last STATUS: line and next run) and "table" (bordered job details).
+ * "hidden" mounts nothing. Relative times refresh every second.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -33,7 +32,7 @@ function sanitizeStatusLine(line: string): string {
     .trim();
 }
 
-/** Status icon for a job — shared by the table rows and the compact line.
+/** Status icon for a job in the compact and table views.
  *  All icons stay in the Geometric Shapes family (font-safe in terminals
  *  that flatten Dingbats/arrows like ✓ ⟳ ✗ ⚠): ● ok, ◐ running,
  *  ■ error, ▲ anomaly, ○ disabled. */
@@ -73,9 +72,6 @@ function humanSchedule(job: CronJob): string {
   return job.schedule;
 }
 
-/**
- * Format relative time (e.g., "in 5m", "2h ago")
- */
 /** Go-style lowercase duration tokens (30s / 5m / 2h / 1d) — the convention
  *  both humans and models parse most reliably; uppercase M would collide
  *  with ISO-8601 months (P1M) and is the classic misread. */
@@ -99,16 +95,6 @@ function formatRelativeTime(date: Date | string, periodMs?: number | null): stri
   // for the past; a known period appends the total.
   if (diff > 0) return periodMs ? `${token}/${compactToken(periodMs)}` : token;
   return `${token}+`;
-}
-
-/** 5-cell small filled/hollow square meter: "▪▪▫▫▫". Filled=success green,
- *  hollow track=dim; ~1 char-width tall; resets each fire. Five cells give
- *  clear at-a-glance estimation (20% per cell) at a compact width, and the
- *  Geometric Shapes glyphs render natively where Block Elements flatten. */
-function progressBar(elapsedMs: number, periodMs: number, theme: any): string {
-  const cells = 5;
-  const filled = Math.max(0, Math.min(cells, Math.round((elapsedMs / periodMs) * cells)));
-  return `${theme.fg("success", "▪".repeat(filled))}${theme.fg("dim", "▫".repeat(cells - filled))}`;
 }
 
 /**
@@ -152,14 +138,11 @@ export class CronWidget {
         render: (width: number) => this.renderWidget(width, theme),
         invalidate: () => {},
       }),
-      { placement: "belowEditor" },
+      { placement: "aboveEditor" },
     );
 
-    // 30s tick re-renders so relative-time labels ("in 5m") update even when
-    // nothing else changes. Same path as cron:change-driven refresh.
+    // Refresh countdowns even when no job events occur.
     if (!this.refreshInterval) {
-      // 1s tick so the progress bar visibly fills between beats; the render
-      // itself is a single line, so the cost is negligible.
       this.refreshInterval = setInterval(() => this.refresh(), 1000);
     }
   }
@@ -191,18 +174,11 @@ export class CronWidget {
     return this.getStyle() === "table" ? this.renderTable(width, theme) : this.renderCompact(width, theme);
   }
 
-  /** Compact style: one borderless status line. At most MAX_COMPACT_JOBS
-   *  entries — highest urgency first — share the width EQUALLY; each entry
-   *  compresses internally (identity > progress > next-run) instead of whole
-   *  jobs being dropped, and overflow beyond the cap is simply not shown
-   *  (the table style remains the full view). When the natural content is
-   *  narrower than the available width, the slack is justified evenly into
-   *  the separators so the line spans the full screen width. */
+  /** Compact style: one borderless line with equally sized entry budgets.
+   *  The table style remains available for the full job list. */
   private renderCompact(width: number, theme: any): string[] {
     const jobs = this.uniqueJobs().slice().sort((a, b) => compactRank(a) - compactRank(b));
-    // ◆ diamond (Geometric Shapes — font-safe like ▪▫; card-suit ♥ renders
-    // oddly in some terminal fonts). Red keeps the heartbeat accent.
-    const prefix = `${theme.fg("error", "◆")} `;
+    const prefix = `${theme.fg("dim", "heartbeat")} `;
     const baseSeparator = " · ";
     const sepWidth = visibleWidth(baseSeparator);
 
@@ -212,108 +188,65 @@ export class CronWidget {
 
     const parts = shown.map((job) => this.compactEntryFit(job, theme, Math.max(1, share)));
 
-    // Full-width justification: when the natural entries leave slack, spread
-    // it evenly across the separators (first gaps absorb the remainder) so
-    // the line occupies the whole available width instead of ending early.
-    let line: string;
-    if (parts.length > 1) {
-      const gaps = parts.length - 1;
-      const natural = visibleWidth(prefix) + parts.reduce((sum, p) => sum + visibleWidth(p), 0);
-      const slack = Math.max(0, width - natural - sepWidth * gaps);
-      // Cap per-gap padding: full justification looks broken with few long
-      // entries (one giant hole in the middle); 8 extra columns still reads
-      // as evenly spread with 3+ jobs.
-      const extra = Math.min(8, Math.floor(slack / gaps));
-      const segments: string[] = [prefix];
-      for (let i = 0; i < parts.length; i++) {
-        segments.push(parts[i]);
-        if (i < gaps) {
-          const gapWidth = 3 + extra + (i < slack - extra * gaps ? 1 : 0);
-          const left = Math.floor((gapWidth - 1) / 2);
-          segments.push(`${" ".repeat(left)}·${" ".repeat(gapWidth - 1 - left)}`);
-        }
-      }
-      line = segments.join("");
-    } else {
-      line = prefix + (parts[0] ?? "");
-    }
-
-    // Final width safety (e.g. degenerate widths smaller than the prefix).
-    return [truncateToWidth(line, width, "")];
+    return [truncateToWidth(prefix + parts.join(theme.fg("dim", baseSeparator)), width, "")];
   }
 
-  /** The meter segment (progress bar + total) for a job, or null when the
-   *  period is unknown. Shared by the natural and compressed entry forms. */
-  private meterFor(job: CronJob, theme: any): string | null {
-    const nextRun = this.scheduler.getNextRun(job.id);
-    const period = this.scheduler.getBeatPeriodMs?.(job.id) ?? null;
-    const lastMs = job.lastRun ? new Date(job.lastRun).getTime() : null;
-    if (period && lastMs) {
-      // Progress form: 5-cell filled/hollow squares over the beat period
-      // (resets each fire) + the total, e.g. "▪▪▫▫▫ 30s".
-      const elapsed = Math.max(0, Date.now() - lastMs);
-      return `${progressBar(elapsed, period, theme)} ${compactToken(period)}`;
-    }
-    if (period && nextRun) {
-      // Before the first beat (no lastRun yet): derive elapsed from the
-      // countdown — the bar starts filling from job creation instead of
-      // showing a bare remaining/total countdown.
-      const remaining = Math.max(0, nextRun.getTime() - Date.now());
-      const elapsed = Math.max(0, Math.min(period, period - remaining));
-      return `${progressBar(elapsed, period, theme)} ${compactToken(period)}`;
-    }
-    return null;
-  }
-
-  /** One compact entry: `icon name` + dim status line (or humanized
-   *  schedule) + meter. */
+  /** One compact entry: name, state when noteworthy, detail, and next run. */
   private compactEntry(job: CronJob, theme: any): string {
-    const icon = statusIconFor(job, theme);
-    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
-    const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
-    const detail = theme.fg("dim", detailRaw);
-    const parts = [`${icon} ${name}`, detail];
-    const meter = this.meterFor(job, theme);
-    if (meter) {
-      parts.push(meter);
-    } else {
-      const nextRun = this.scheduler.getNextRun(job.id);
-      if (nextRun) parts.push(formatRelativeTime(nextRun));
-    }
-    return parts.join(" ");
+    const head = this.compactHead(job, theme);
+    const detail = this.compactDetail(job);
+    const tail = this.compactTail(job, theme);
+    return [head, detail ? theme.fg("dim", detail) : "", tail].filter(Boolean).join(" ");
   }
 
-  /** One compact entry compressed to `share` columns. Compression priority:
-   *  identity (icon+name) survives longest, then the METER (dropping it is
-   *  what users notice — the status text yields first, then truncates),
-   *  and only a share too small for head+meter together truncates the
-   *  whole entry. */
+  /** Compress detail before the job identity and countdown. */
   private compactEntryFit(job: CronJob, theme: any, share: number): string {
     const full = this.compactEntry(job, theme);
     if (visibleWidth(full) <= share) return full;
 
-    const icon = statusIconFor(job, theme);
-    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
-    const head = `${icon} ${name}`;
+    const head = this.compactHead(job, theme);
+    const tail = this.compactTail(job, theme);
     const headWidth = visibleWidth(head);
-    const meter = this.meterFor(job, theme) ?? this.fallbackTailFor(job);
-    const meterWidth = meter ? visibleWidth(meter) + 1 : 0;
+    const tailWidth = tail ? visibleWidth(tail) + 1 : 0;
 
-    if (headWidth + meterWidth + 1 >= share) {
-      // Even head + meter barely fit: fall back to truncating the whole
-      // natural entry rather than dropping the meter.
-      return truncateToWidth(full, Math.max(1, share), "…");
+    if (headWidth + tailWidth >= share) {
+      return truncateToWidth([head, tail].filter(Boolean).join(" "), Math.max(1, share), "…");
     }
-    const detailRaw = sanitizeStatusLine(job.lastStatusLine ?? "") || humanSchedule(job);
-    const room = share - headWidth - meterWidth - 1;
-    const detail = room > 0 ? theme.fg("dim", truncateToWidth(detailRaw, room, "…")) : "";
-    return [head, detail, meter].filter(Boolean).join(" ");
+    const detailRaw = this.compactDetail(job);
+    const room = share - headWidth - tailWidth - 1;
+    const detail = room > 0 && detailRaw ? theme.fg("dim", truncateToWidth(detailRaw, room, "…")) : "";
+    return [head, detail, tail].filter(Boolean).join(" ");
   }
 
-  /** Period-unknown fallback tail (plain countdown) for compression. */
-  private fallbackTailFor(job: CronJob): string | null {
+  private compactDetail(job: CronJob): string {
+    const status = sanitizeStatusLine(job.lastStatusLine ?? "");
+    if (status) return status;
+    if (job.model && job.enabled && !job.runCount) return "waiting for first run";
     const nextRun = this.scheduler.getNextRun(job.id);
-    return nextRun ? formatRelativeTime(nextRun) : null;
+    const period = this.scheduler.getBeatPeriodMs?.(job.id) ?? null;
+    return nextRun && period && period > 0 && job.enabled ? "" : humanSchedule(job);
+  }
+
+  private compactHead(job: CronJob, theme: any): string {
+    const name = job.enabled ? theme.fg("text", job.name) : theme.fg("muted", job.name);
+    const icon = statusIconFor(job, theme);
+    if (!job.enabled) return `${icon} ${theme.fg("dim", "paused")} ${name}`;
+    if (job.lastStatus === "error") return `${icon} ${theme.fg("error", "error")} ${name}`;
+    if (job.lastOutcome === "anomaly") return `${icon} ${theme.fg("warning", "anomaly")} ${name}`;
+    if (job.lastStatus === "running") return `${icon} ${theme.fg("dim", "running")} ${name}`;
+    return `${icon} ${name}`;
+  }
+
+  private compactTail(job: CronJob, theme: any): string | null {
+    const nextRun = this.scheduler.getNextRun(job.id);
+    if (!nextRun) return null;
+    const period = this.scheduler.getBeatPeriodMs?.(job.id) ?? null;
+    const countdown = theme.fg("dim", formatRelativeTime(nextRun, period));
+    if (!period || period <= 0 || !job.enabled) return countdown;
+    const elapsed = Math.max(0, Math.min(period, period - (nextRun.getTime() - Date.now())));
+    const filled = Math.round((elapsed / period) * 5);
+    const bar = theme.fg("accent", "▰".repeat(filled)) + theme.fg("dim", "▱".repeat(5 - filled));
+    return `${bar} ${countdown}`;
   }
 
   /**

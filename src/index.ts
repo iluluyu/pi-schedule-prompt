@@ -56,26 +56,26 @@ export default async function (pi: ExtensionAPI) {
     switch (details?.mode) {
       case "subagent_start":
         line =
-          theme.fg("accent", `🕐 Scheduled${tag}: ${jobName}`) +
-          (prompt ? theme.fg("dim", ` → "${prompt}"`) : "");
+          theme.fg("accent", `Scheduled${tag}: ${jobName}`) +
+          (prompt ? theme.fg("dim", ` · "${prompt}"`) : "");
         break;
       case "subagent_done":
         line =
-          theme.fg("accent", `✓ Scheduled${tag} finished: ${jobName}`) +
-          (details?.output ? theme.fg("dim", ` → ${details.output}`) : "");
+          theme.fg("accent", `Scheduled${tag} finished: ${jobName}`) +
+          (details?.output ? theme.fg("dim", ` · ${details.output}`) : "");
         break;
       case "subagent_error":
         line =
-          theme.fg("error", `✗ Scheduled${tag} failed: ${jobName}`) +
-          (details?.error ? theme.fg("dim", ` → ${details.error}`) : "");
+          theme.fg("error", `Scheduled${tag} failed: ${jobName}`) +
+          (details?.error ? theme.fg("dim", ` · ${details.error}`) : "");
         break;
       case "subagent_recovered":
-        line = theme.fg("success", `✓ Scheduled${tag} recovered: ${jobName}`);
+        line = theme.fg("success", `Scheduled${tag} recovered: ${jobName}`);
         break;
       default:
         line =
-          theme.fg("accent", `🕐 Scheduled: ${jobName}`) +
-          (prompt ? theme.fg("dim", ` → "${prompt}"`) : "");
+          theme.fg("accent", `Scheduled: ${jobName}`) +
+          (prompt ? theme.fg("dim", ` · "${prompt}"`) : "");
     }
 
     return new Text(line, 0, 0);

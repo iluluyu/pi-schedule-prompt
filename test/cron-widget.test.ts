@@ -123,6 +123,7 @@ describe("CronWidget — render", () => {
     widget.show(ctx);
 
     expect(ctx.ui.setWidget).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.setWidget.mock.calls[0][2]).toEqual({ placement: "aboveEditor" });
     const widgetFactory = ctx.ui.setWidget.mock.calls[0][1];
     const theme = { fg: () => {}, bold: (s: string) => s, error: (s: string) => s, success: (s: string) => s, warning: (s: string) => s, muted: (s: string) => s, accent: (s: string) => s, text: (s: string) => s };
     const widgetImpl = widgetFactory(null, theme);
@@ -131,7 +132,7 @@ describe("CronWidget — render", () => {
 });
 
 describe("CronWidget — compact style", () => {
-  it("renders one borderless line with heart prefix, status line, and next run", () => {
+  it("renders one borderless line with a quiet label, status line, and next run", () => {
     const job = exampleJob({
       name: "health",
       lastStatusLine: "STATUS: all good",
@@ -144,7 +145,9 @@ describe("CronWidget — compact style", () => {
 
     expect(lines).toHaveLength(1);
     const line = lines[0];
-    expect(line).toContain("◆");
+    expect(line).toContain("heartbeat");
+    expect(line).toContain("●");
+    expect(line).not.toContain("◆");
     expect(line).toContain("health");
     expect(line).toContain("STATUS: all good");
     expect(line).toContain("12m");
@@ -158,6 +161,16 @@ describe("CronWidget — compact style", () => {
     const job = exampleJob({ name: "standup", schedule: "0 0 9 * * 1-5" });
     const lines = renderCompact([job]);
     expect(lines[0]).toContain("9am weekdays");
+  });
+
+  it("shows a waiting hint before the first subagent run, then its latest status", () => {
+    const job = exampleJob({ name: "watcher", model: "fast", type: "interval", schedule: "5m" });
+    const options = { periodMs: 300000, nextRun: new Date(Date.now() + 240000) };
+    expect(renderCompact([job], options)[0]).toContain("waiting for first run");
+    const updated = { ...job, runCount: 1, lastStatusLine: "Check complete" };
+    const line = renderCompact([updated], options)[0];
+    expect(line).toContain("Check complete");
+    expect(line).not.toContain("waiting for first run");
   });
 
   it("sanitizes ANSI escapes out of the status line", () => {
@@ -187,10 +200,9 @@ describe("CronWidget — compact style", () => {
     expect(iAnom).toBeLessThan(iOk);
     expect(iOk).toBeLessThan(iOff);
 
-    expect(line).toContain("■");
-    expect(line).toContain("▲");
-    expect(line).toContain("●");
-    expect(line).toContain("○");
+    expect(line).toContain("error cc-error");
+    expect(line).toContain("anomaly bb-anomaly");
+    expect(line).toContain("paused dd-off");
   });
 
   it("joins multiple entries with the dot separator", () => {
@@ -221,34 +233,24 @@ describe("CronWidget — compact style", () => {
     expect(wide[0]).not.toMatch(/\+\d+$/);
 
     // Tight width: entries compress per-share, nothing folds into +N.
-    const tight = renderCompact([...jobs, mk("4", "fourth-job", "waiting")], { width: 60 });
+    const tight = renderCompact([...jobs, mk("4", "fourth-job", "waiting")], { width: 80 });
     expect(tight).toHaveLength(1);
     const line = tight[0];
-    expect(visibleWidth(line)).toBeLessThanOrEqual(60);
+    expect(visibleWidth(line)).toBeLessThanOrEqual(80);
     expect(line).toContain("first-job");
-    // 4 jobs x ~15 cols each needs more than 60 — names compress mid-way,
-    // which is the point: every job keeps a fragment, none is dropped.
-    expect(line).toContain("second-jo");
-    expect(line).toContain("third-jo");
-    expect(line).toContain("fourth-jo");
+    expect(line).toContain("second-job");
+    expect(line).toContain("third-job");
+    expect(line).toContain("fourth-job");
     expect(line).not.toMatch(/\+\d+$/);
   });
 
-  it("spreads slack into the separator, capped at 8 extra columns per gap", () => {
+  it("keeps separators compact even when the terminal is wide", () => {
     const a = exampleJob({ id: "1", name: "one", lastStatusLine: "s1" });
     const b = exampleJob({ id: "2", name: "two", lastStatusLine: "s2" });
-    // Saturated render (huge slack -> gap = 3 + 8 cap).
-    const saturated = visibleWidth(renderCompact([a, b], { width: 400 })[0]);
-    expect(saturated).toBeLessThan(400);
-    const lines = renderCompact([a, b], { width: 120 });
-    expect(lines).toHaveLength(1);
-    expect(visibleWidth(lines[0])).toBe(saturated); // slack still exceeds the cap
-    expect(lines[0]).toContain("one");
-    expect(lines[0]).toContain("two");
-    expect(lines[0]).toContain("·");
+    expect(renderCompact([a, b], { width: 400 })[0]).toBe("heartbeat ● one s1 · ● two s2");
   });
 
-  it("compresses the status text, never the meter, under width pressure", () => {
+  it("compresses status text before the countdown under width pressure", () => {
     const long = exampleJob({
       id: "1",
       name: "watcher",
@@ -257,17 +259,16 @@ describe("CronWidget — compact style", () => {
       lastRun: new Date().toISOString(),
     });
     const other = exampleJob({ id: "2", name: "other", lastStatusLine: "ok" });
-    const lines = renderCompact([long, other], { width: 80, periodMs: 30000 });
+    const lines = renderCompact([long, other], { width: 80, periodMs: 30000, nextRun: new Date(Date.now() + 18000) });
     const line = lines[0];
     expect(visibleWidth(line)).toBeLessThanOrEqual(80);
-    // The meter survives; the long detail is the part that truncated.
-    expect((line.match(/▪|▫/g) ?? []).length).toBeGreaterThanOrEqual(5);
-    expect(line).toContain("30s");
+    expect(line).toMatch(/\d+s\/30s/);
+    expect(line).toMatch(/[▰▱]{5}/);
     expect(line).toContain("…");
     expect(line).not.toContain("x".repeat(20));
   });
 
-  it("renders a progress bar + total period between beats", () => {
+  it("renders progress and remaining time between beats", () => {
     const job = exampleJob({
       id: "1",
       name: "ticker",
@@ -280,21 +281,38 @@ describe("CronWidget — compact style", () => {
       periodMs: 30000,
       nextRun: new Date(Date.now() + 18000),
     });
-    expect(lines[0]).toContain("30s");
-    expect((lines[0].match(/▪/g) ?? []).length).toBe(2); // filled cells at 40%
-    expect((lines[0].match(/▫/g) ?? []).length).toBe(3); // hollow track cells
+    expect(lines[0]).toMatch(/\d+s\/30s/);
+    expect(lines[0]).toContain("▰▰▱▱▱");
   });
 
-  it("fills the bar from creation when the first beat has not run yet", () => {
+  it("does not repeat the schedule beside a countdown with the same period", () => {
+    const job = exampleJob({ name: "ticker", type: "interval", schedule: "5m", intervalMs: 300000 });
+    const line = renderCompact([job], { periodMs: 300000, nextRun: new Date(Date.now() + 240000) })[0];
+    expect(line).toMatch(/ticker [▰▱]{5} [34]m\/5m/);
+    expect(line.match(/5m/g)).toHaveLength(1);
+  });
+
+  it("does not leave an empty styled detail between the name and progress", () => {
+    const job = exampleJob({ name: "ticker", type: "interval", schedule: "5m", intervalMs: 300000 });
+    const scheduler = makeSchedulerWithNextRun(new Date(Date.now() + 240000), 300000);
+    const { widget, ctx } = mountWidget([job], "compact", scheduler);
+    widget.show(ctx);
+    const factory = ctx.ui.setWidget.mock.calls[0][1];
+    const theme = { ...identityTheme(), fg: (_color: string, s: string) => `\x1b[90m${s}\x1b[39m` };
+    const line = factory(null, theme).render(100)[0].replace(/\x1b\[[0-9;]*m/g, "");
+    expect(line).toMatch(/ticker [▰▱]{5} [34]m\/5m/);
+    widget.destroy();
+  });
+
+  it("shows the next run and period before the first beat", () => {
     const job = exampleJob({ id: "1", name: "fresh", lastStatusLine: "ok", intervalMs: 600000 });
     const lines = renderCompact([job], {
       width: 100,
       periodMs: 600000,
       nextRun: new Date(Date.now() + 9 * 60_000), // 9m remaining of a 10m period
     });
-    expect(lines[0]).toContain("10m");
-    expect((lines[0].match(/▪/g) ?? []).length).toBe(1); // ~10% elapsed -> 1 filled cell
-    expect((lines[0].match(/▫/g) ?? []).length).toBe(4);
+    expect(lines[0]).toMatch(/[89]m\/10m/);
+    expect(lines[0]).toContain("▰▱▱▱▱");
   });
 
   it("caps the compact line at 5 jobs — overflow is hidden, not shown", () => {
@@ -308,8 +326,13 @@ describe("CronWidget — compact style", () => {
     expect(lines[0]).not.toMatch(/\+\d+$/);
   });
 
+  it("keeps an error visible before a long name at narrow widths", () => {
+    const job = exampleJob({ name: "long-job-name", lastStatus: "error" });
+    expect(renderCompact([job], { width: 18 })[0]).toContain("error");
+  });
+
   it("keeps the line within width even for degenerate narrow widths", () => {
-    const job = exampleJob({ name: "x".repeat(80), lastStatusLine: "y".repeat(60) });
+    const job = exampleJob({ name: "巡检".repeat(40), lastStatusLine: "y".repeat(60) });
     for (const width of [1, 5, 12, 25]) {
       const lines = renderCompact([job], { width });
       expect(lines).toHaveLength(1);
