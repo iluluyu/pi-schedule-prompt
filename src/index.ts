@@ -5,7 +5,8 @@
  * - A `schedule_prompt` tool for managing scheduled prompts
  * - A widget displaying all scheduled prompts with status
  * - /schedule-prompt command for interactive management
- * - Persistence via .pi/schedule-prompts.json (jobs) and .pi/schedule-prompts-settings.json (settings)
+ * - Persistence: jobs in <agentDir>/schedule-prompts/projects/<sha256(cwd)>.json; settings in
+ *   <agentDir>/schedule-prompts-settings.json (global) and .pi/schedule-prompts-settings.json (project, trusted only)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -22,10 +23,38 @@ import { CronWidget } from "./ui/cron-widget.js";
 import { JobsView } from "./ui/jobs-view.js";
 import { PeekView } from "./ui/peek-view.js";
 
+/** Longest pi quit waits for in-flight subagent teardown. */
+const SHUTDOWN_TEARDOWN_TIMEOUT_MS = 10_000;
+
+/** Resolve when all `pending` settle or after `ms`, whichever is first. */
+export async function waitForTeardowns(pending: Set<Promise<void>>, ms: number): Promise<void> {
+  if (pending.size === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), ms);
+  });
+  const outcome = await Promise.race([
+    Promise.allSettled([...pending]).then(() => "done" as const),
+    timeout,
+  ]);
+  clearTimeout(timer);
+  if (outcome === "timeout") {
+    console.warn(
+      `[pi-schedule-prompt] Subagent teardown did not finish within ${ms}ms of shutdown; exiting anyway.`,
+    );
+  }
+}
+
 export default async function (pi: ExtensionAPI) {
   let storage: CronStorage;
   let scheduler: CronScheduler;
   let widget: CronWidget;
+  // Subagent teardowns still running, from every scheduler this extension has
+  // created. pi (>=1.5) always emits session_shutdown before replacing a
+  // session, but initializeSession also tears down defensively when a
+  // session_start arrives without one; tracking here keeps that path from
+  // dropping in-flight teardowns. Awaited, bounded, on session_shutdown.
+  const pendingTeardowns = new Set<Promise<void>>();
   // Refreshed in initializeSession; mutated by Settings submenu. The tool and
   // widget read via closure so toggles take effect without re-registering.
   let settings: ScheduleSettings = {};
@@ -33,6 +62,10 @@ export default async function (pi: ExtensionAPI) {
   // migrating legacy widgetVisible:false → "hidden"); the fallback keeps
   // the pre-initialize window safe.
   const getWidgetStyle = () => settings.widgetStyle ?? "compact";
+  // ctx.isProjectTrusted() at session start. Project-local files (settings
+  // override, legacy job store) are honored only for trusted projects.
+  let projectTrusted = false;
+  const notPersistedReason = () => (projectTrusted ? "failed to persist" : "project not trusted");
 
   // Register custom message renderer for scheduled prompts
   pi.registerMessageRenderer("scheduled_prompt", (message, _options, theme) => {
@@ -96,10 +129,24 @@ export default async function (pi: ExtensionAPI) {
     // Without this, every `session_start` (fires on reload/resume/fork too, not
     // only on fresh startup) leaks a live croner timer into the event loop,
     // accumulating duplicate fires for every recurring job over time.
+    // The old runs' teardown finishes in the background (tracked in pendingTeardowns).
     cleanupSession(ctx);
 
-    settings = loadSettings(ctx.cwd);
+    projectTrusted = ctx.isProjectTrusted?.() === true;
+    settings = loadSettings(ctx.cwd, projectTrusted);
     storage = new CronStorage(ctx.cwd);
+    const migration = storage.migrateLegacy(projectTrusted);
+    if (migration === "untrusted") {
+      ctx.ui?.notify?.(
+        "Scheduled prompts in this project's .pi/schedule-prompts.json were not imported: the project is not trusted.",
+        "warning",
+      );
+    } else if (migration === "failed") {
+      ctx.ui?.notify?.(
+        "Could not import this project's .pi/schedule-prompts.json; see the log.",
+        "warning",
+      );
+    }
     scheduler = new CronScheduler(storage, pi, ctx);
     widget = new CronWidget(storage, scheduler, pi, getWidgetStyle, ctx.sessionManager.getSessionId());
 
@@ -109,10 +156,12 @@ export default async function (pi: ExtensionAPI) {
     widget.show(ctx);
   };
 
-  const cleanupSession = (ctx: any) => {
-    // Stop scheduler
+  const cleanupSession = (ctx: any): void => {
+    // Stop scheduler (timers clear synchronously; subagent teardown settles later)
     if (scheduler) {
-      scheduler.stop();
+      const stopped = scheduler.stop();
+      pendingTeardowns.add(stopped);
+      void stopped.finally(() => pendingTeardowns.delete(stopped));
     }
 
     // Hide widget
@@ -154,6 +203,41 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     autoCleanupDisabledJobs(ctx);
     cleanupSession(ctx);
+    // pi exits right after session_shutdown handlers resolve, which would cut
+    // off subagent extensions' cleanup (orphaning e.g. MCP child processes).
+    // Wait for it, but bounded: a run stuck in setup (e.g. a hung extension
+    // session_start) never settles, and quit must not hang on it.
+    await waitForTeardowns(pendingTeardowns, SHUTDOWN_TEARDOWN_TIMEOUT_MS);
+  });
+
+  // --- Idle tracking for `idle` jobs ---
+  // `agent_settled`, not `agent_end`: pi can start more runs after agent_end
+  // (retries, compaction retry, queued follow-ups); settled is the final-idle signal.
+  pi.on("agent_start", async () => {
+    scheduler?.onBusy();
+  });
+
+  pi.on("agent_settled", async (event) => {
+    scheduler?.onSettled(event.aborted);
+  });
+
+  pi.on("input", async (event) => {
+    // Our own scheduled prompts arrive as source "extension" and must not
+    // start a new idle stretch, or an idle job would re-arm itself.
+    if (event.source !== "extension") scheduler?.onUserInput();
+  });
+
+  pi.on("user_bash", async () => {
+    scheduler?.onUserActivity();
+  });
+
+  // Blocking dialogs, including this extension's own /schedule-prompt menus.
+  pi.on("ui_prompt_start", async (event) => {
+    scheduler?.onPromptStart(event.kind);
+  });
+
+  pi.on("ui_prompt_end", async () => {
+    scheduler?.onPromptEnd();
   });
 
   // --- Register /schedule-prompt command ---
@@ -173,9 +257,11 @@ export default async function (pi: ExtensionAPI) {
           let jobsOverlay: OverlayHandle | undefined;
           const hideJobsDuring = async (flow: () => Promise<void>) => {
             jobsOverlay?.setHidden(true);
+            scheduler.pauseForDialog();
             try {
               await flow();
             } finally {
+              scheduler.resumeAfterDialog();
               jobsOverlay?.setHidden(false);
               jobsOverlay?.focus();
             }
@@ -241,10 +327,10 @@ export default async function (pi: ExtensionAPI) {
               const next = order[(order.indexOf(getWidgetStyle()) + 1) % order.length];
               settings = { ...settings, widgetStyle: next };
               next === "hidden" ? widget.hide(ctx) : widget.show(ctx);
-              const persisted = saveSettings(ctx.cwd, { widgetStyle: next });
+              const persisted = saveSettings(ctx.cwd, { widgetStyle: next }, projectTrusted);
               if (!persisted) {
                 ctx.ui.notify(
-                  `Widget style: ${next} (session only; failed to persist)`,
+                  `Widget style: ${next} (session only; ${notPersistedReason()})`,
                   "warning",
                 );
               }
@@ -252,10 +338,10 @@ export default async function (pi: ExtensionAPI) {
               // Affects newly-created jobs only; existing jobs keep their binding.
               const next = bound ? "workdir" : "session";
               settings = { ...settings, defaultJobScope: next };
-              const persisted = saveSettings(ctx.cwd, { defaultJobScope: next });
+              const persisted = saveSettings(ctx.cwd, { defaultJobScope: next }, projectTrusted);
               if (!persisted) {
                 ctx.ui.notify(
-                  `Bind new jobs to session: ${next === "session" ? "yes" : "no"} (session only; failed to persist)`,
+                  `Bind new jobs to session: ${next === "session" ? "yes" : "no"} (session only; ${notPersistedReason()})`,
                   "warning",
                 );
               }

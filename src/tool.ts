@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { nanoid } from "nanoid";
 import { readRuns, runLogPath } from "./run-log.js";
-import { CronScheduler } from "./scheduler.js";
+import { CronScheduler, displaySchedule, formatLocal } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
 import type { CronStorage } from "./storage.js";
 import type { CronJob, CronJobType, CronToolDetails, } from "./types.js";
@@ -32,7 +32,11 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, logs (read archived subagent run outputs; needs jobId, optional tail). For quiet recurring monitoring set model='fast' or 'current', notifyOn='anomaly' AND displayOn='anomaly' (auto-applied to heartbeat-like prompts): healthy runs then post nothing to the chat or model context and are archived on disk; anomalies still display and wake the parent.",
+      "Schedule a prompt to run later, triggered by time or by user inactivity. Use it when the user wants something to happen at a time ('every morning', 'in 10 minutes', 'at 5pm') or after they have been inactive ('if I'm away for 15 minutes'). To do work now or in parallel, do it directly instead of scheduling it a few seconds out.\n" +
+      "IMPORTANT: action='add' requires 'schedule' and 'prompt', and 'type' must match the schedule's format: 'cron' (default) takes a 6-field cron expression ('0 0 9 * * *' = 9am daily); 'once' takes a relative time ('+10m') or ISO timestamp; 'interval' and 'idle' take a duration ('5m').\n" +
+      "When a job fires without 'model', its prompt arrives in this chat as a user message for you to act on. With 'model', it runs in a separate session that cannot see this chat; use 'fast' or 'current' for an automatic cheap pick. For quiet recurring monitoring set notifyOn='anomaly' AND displayOn='anomaly' (auto-applied to heartbeat-like prompts): healthy runs then post nothing to the chat or model context and are archived on disk, while anomalies still display and wake the parent. resident=true (requires model) keeps one session alive across beats and enables action='ask'.\n" +
+      "Jobs fire only while pi is running. You cannot add jobs while a scheduled prompt is among the last few messages of this chat (prevents loops); ask the user to retry after the next exchange.\n" +
+      "Actions: add (schedule+prompt); list (shows jobs and their IDs); update (jobId; changes any field except 'type' — to change type, remove and re-add); enable/disable/remove (jobId); cleanup (deletes all disabled jobs); logs (jobId, optional tail: read a background job's archived runs); ask (resident jobs only: ad-hoc question into the live session); transcript (resident jobs only: view the session's recent dialogue).",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -68,7 +72,7 @@ export function createCronTool(
               if (!params.schedule) missing.push("'schedule'");
               if (!params.prompt) missing.push("'prompt'");
               throw new Error(
-                `Missing required parameters for add action: ${missing.join(" and ")}. You must provide both schedule (e.g., '+10s', '*/5 * * * * *') and prompt (the text to execute).`
+                `Missing required parameters for add action: ${missing.join(" and ")}. You must provide both schedule (e.g., '+10s', '*/5 * * * * *') and prompt (the text to execute). Set 'type' to match the schedule: 'once' for '+10s' or ISO, 'interval'/'idle' for '5m', 'cron' for 6-field cron.`
               );
             }
 
@@ -142,13 +146,13 @@ export function createCronTool(
             details.jobName = job.name;
 
             const modelLine = job.model
-              ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.displayOn ? `, display=${job.displayOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
+              ? `\nModel: ${job.model} (runs in separate session${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.displayOn ? `, display=${job.displayOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
               : "";
             return {
               content: [
                 {
                   type: "text",
-                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}\nPrompt: ${job.prompt}${modelLine}`,
+                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${displaySchedule(job)}\nPrompt: ${job.prompt}${modelLine}`,
                 },
               ],
               details,
@@ -265,16 +269,23 @@ export function createCronTool(
             }
 
             // Reject empty-string model (schema also enforces minLength: 1).
-            // To switch a job from subagent → inline mode, remove and re-add
-            // it without `model` — there's no in-place clearing.
+            // To switch a job from separate-session → inline mode, remove and
+            // re-add it without `model` — there's no in-place clearing.
             if (params.model !== undefined && params.model.length === 0) {
               throw new Error(
-                "'model' must be a non-empty string. To switch a job from subagent back to inline, remove and re-add it without a model."
+                "'model' must be a non-empty string. To switch a job back to inline, remove and re-add it without 'model'."
               );
             }
 
             const updates: Partial<CronJob> = {};
-            if (params.name) updates.name = params.name;
+            if (params.name && params.name !== job.name) {
+              if (storage.hasJobWithName(params.name)) {
+                throw new Error(
+                  `A job named "${params.name}" already exists. Please use a different name.`
+                );
+              }
+              updates.name = params.name;
+            }
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
             if (params.model !== undefined) updates.model = params.model;
@@ -342,13 +353,13 @@ export function createCronTool(
             for (const job of jobs) {
               const status = job.enabled ? "✓" : "✗";
               const nextRun = scheduler.getNextRun(job.id);
-              const nextStr = nextRun ? `Next: ${nextRun.toISOString()}` : "";
-              const lastStr = job.lastRun ? `Last: ${job.lastRun}` : "Never run";
+              const nextStr = nextRun ? `Next: ${formatLocal(nextRun)}` : "";
+              const lastStr = job.lastRun ? `Last: ${formatLocal(job.lastRun)}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
+              lines.push(`  Type: ${job.type} | Schedule: ${displaySchedule(job)}`);
               if (job.model) {
-                lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.displayOn ? `, display=${job.displayOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
+                lines.push(`  Model: ${job.model} (runs in separate session${job.notify ? ", notifies parent" : ""}${job.notifyOn ? `, notify=${job.notifyOn}` : ""}${job.displayOn ? `, display=${job.displayOn}` : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
               }
               if (job.stopOn) lines.push(`  Stop on: ${job.stopOn}`);
               lines.push(`  Prompt: ${job.prompt}`);
@@ -561,7 +572,7 @@ export function createCronTool(
           const status = job.enabled ? theme.fg("success", "✓") : theme.fg("muted", "✗");
           lines.push(`${status} ${theme.fg("text", job.name)} ${theme.fg("dim", `(${job.id})`)}`);
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${displaySchedule(job)}`
           );
           if (job.model) {
             const subagentTag = job.notify ? "(subagent, notifies parent)" : "(subagent)";
@@ -576,7 +587,7 @@ export function createCronTool(
           if (job.stopOn) lines.push(`  ${theme.fg("dim", "Stop on:")} ${job.stopOn}`);
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {
-            lines.push(`  ${theme.fg("dim", "Last run:")} ${job.lastRun}`);
+            lines.push(`  ${theme.fg("dim", "Last run:")} ${formatLocal(job.lastRun)}`);
           }
           lines.push(`  ${theme.fg("dim", "Runs:")} ${job.runCount}`);
         }

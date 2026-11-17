@@ -52,6 +52,7 @@ beat rate.
 - **Job types**:
   - **Recurring** (cron/interval) — repeats automatically
   - **One-shot** (once) — runs once then auto-disables
+  - **Idle** (idle) — runs once after the agent has been idle for a set time, e.g. for maintenance
 - **Per-task model (optional)**: set `model` on a job to run that prompt in a separate in-process agent session — your current chat is not affected
 - **Actions**: add, remove, list, enable, disable, update, cleanup
 - **Auto-cleanup**: Removes disabled jobs on session exit
@@ -66,6 +67,15 @@ Execute prompts repeatedly at set intervals:
 "schedule 'check build status' every 5 minutes"
 "run 'analyze metrics' every hour"
 "execute 'daily summary' at midnight every day"
+```
+
+#### Run when idle (Maintenance)
+
+Run a prompt once you've stepped away:
+
+```
+"after 15 minutes of inactivity, update the changelog from today's commits"
+"when I've been idle for an hour, run the test suite and summarise failures"
 ```
 
 #### Remind (One-time Notifications)
@@ -99,15 +109,20 @@ pi install npm:pi-schedule-prompt
 **Option B — Load directly (dev):**
 
 ```bash
-pi -e ~/projects/pi-cron-schedule/src/index.ts
+npm --prefix /path/to/pi-schedule-prompt install
+pi -e /path/to/pi-schedule-prompt/src/index.ts
 ```
 
 **Option C — Install from local folder:**
 
 ```bash
-pi install ~/projects/pi-cron-schedule
+cd /path/to/pi-schedule-prompt
+npm install
+pi install .
 ```
 
+Pi does not install dependencies for local-path packages. Run `npm install` in the
+package directory before loading it, and again whenever its dependencies change.
 Then run `pi` normally; the extension auto-discovers.
 
 ## Usage
@@ -136,7 +151,7 @@ The widget displays above your editor (only when jobs exist). In table mode:
 
 `/schedule-prompt` opens a two-item menu:
 
-- **Jobs** — full-screen overlay listing every scheduled prompt in this cwd. Your session's jobs are at the top; jobs bound to other sessions render read-only below. Hotkeys: `↑`/`↓` select, `a` add (opens the input series — name/type/schedule/prompt/scope/confirm), `t` toggle enabled, `s` toggle scope (session-bound ↔ shared with all pi sessions in this cwd), `x` remove (with `y/n` confirm), `c` cleanup all disabled jobs, `q`/`esc` close.
+- **Jobs** — full-screen overlay listing every scheduled prompt in this cwd. Your session's jobs are at the top; jobs bound to other sessions render read-only below. Hotkeys: `↑`/`↓` select, `a` add (opens the input series — name/type/schedule/prompt/scope/confirm), `t` toggle enabled, `s` toggle scope (session-bound ↔ shared with all pi sessions in this project), `x` remove (with `y/n` confirm), `c` cleanup all disabled jobs, `q`/`esc` close.
 - **Settings** — widget visibility and the default scope for new jobs (`Bind new jobs to session: yes/no`). Persists across sessions.
 
 ### Tool Parameters (`schedule_prompt`)
@@ -145,10 +160,10 @@ The widget displays above your editor (only when jobs exist). In table mode:
 |-------|------|----------|-------------|
 | `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` \| `logs` \| `ask` \| `transcript` | yes | Operation to perform |
 | `name` | string | no | Job name (auto-generated if omitted on `add`) |
-| `schedule` | string | on `add` | Cron expression, ISO timestamp, relative time (`+10s`, `+5m`), or interval (`5m`) |
+| `schedule` | string | on `add` | Cron expression, ISO timestamp, relative time (`+10s`, `+5m`), interval (`5m`), or idle duration (`10m`) |
 | `prompt` | string | on `add` | Prompt text to execute when the job fires |
 | `jobId` | string | on `remove` / `enable` / `disable` / `update` | Target job |
-| `type` | `cron` \| `once` \| `interval` | no | Job type. Default `cron`; use `once` for relative times like `+10s` |
+| `type` | `cron` \| `once` \| `interval` \| `idle` | no | Job type. Default `cron`; use `once` for relative times like `+10s`, `idle` to fire after inactivity |
 | `description` | string | no | Free-form note |
 | `model` | non-empty string | no | If set, run the prompt in a fresh in-process agent session instead of injecting it into the current chat. Accepts fuzzy names, `provider/model-id`, or dynamic aliases `current`/`same` (active model) and `fast`/`heartbeat` (small sibling from the active provider). To switch a job back to inline, remove and re-add it without `model` |
 | `notify` | boolean | no | Legacy subagent switch. `true` wakes the parent after every run. For recurring health checks prefer `notifyOn: "anomaly"` |
@@ -169,9 +184,12 @@ The tool accepts multiple time formats:
 | Format | Example | Type | Description |
 |--------|---------|------|-------------|
 | **Relative time** | `+5m`, `+1h`, `+30s`, `+2d` | once | Runs once after delay |
-| **Interval** | `5m`, `1h`, `30s`, `2d` | interval | Repeats at interval |
+| **Interval** | `5m`, `1h`, `30s`, `2d` | interval | Repeats at interval (max `24d`; use cron for longer) |
+| **Idle duration** | `10m`, `1h` | idle | Runs once after the agent has been idle that long (max `24d`) |
 | **ISO timestamp** | `2026-02-13T15:30:00Z` | once | Runs once at exact time |
 | **Cron expression** | `0 */5 * * * *` | cron | Runs on cron schedule |
+
+Times are displayed in local time with their UTC offset. Cron expressions fire in the timezone Node.js runs in. If times show `+00:00` or cron jobs fire in UTC inside a container, set the `TZ` environment variable explicitly (e.g. `-e TZ=America/Asuncion`).
 
 **Cron format** (6 fields - **must include seconds**):
 
@@ -197,12 +215,14 @@ The tool accepts multiple time formats:
 
 **Storage:**
 
-- Job data: `.pi/schedule-prompts.json` (project-local, atomic writes, auto-created)
-- Settings: two-layer config — `~/.pi/agent/schedule-prompts-settings.json` (global, hand-edited defaults) and `<cwd>/.pi/schedule-prompts-settings.json` (project, written by the UI). Project overrides global on load.
+- Job data: `<agentDir>/schedule-prompts/projects/<key>.json`, one file per project (atomic writes, auto-created). `<agentDir>` is pi's agent directory: `$PI_CODING_AGENT_DIR` if set, else `~/.pi/agent`, so each pi profile has its own jobs. `<key>` is the SHA-256 of the project's real path; the file's `cwd` field names the project.
+- Settings: two-layer config — `<agentDir>/schedule-prompts-settings.json` (global, hand-edited defaults) and `<cwd>/.pi/schedule-prompts-settings.json` (project, written by the UI). Project overrides global on load. The project file is read and written only when pi trusts the project.
+- Upgrading from 0.4.x: when pi trusts the project, its old `<cwd>/.pi/schedule-prompts.json` is merged into the new store once and left in place as a backup. While the project is untrusted it is not imported, and pi shows a warning; it is imported once you trust the project.
+- Trust follows pi's own decision (`ctx.isProjectTrusted()`). pi asks only when `.pi/` contains one of its protected files (`settings.json`, `mcp.json`, `extensions`, …), so a project whose `.pi/` holds only this extension's files is trusted automatically unless you saved "do not trust" for it with `/trust`. Review a cloned repo's `.pi/schedule-prompts.json` before opening pi there.
 
 **Job binding:**
 
-By default a job fires only in the session that created it — opening two pi sessions in the same directory won't double-fire schedules. To make a job fire in every pi in this cwd (useful for hand-edited project-wide cron), remove its `session` field from `<cwd>/.pi/schedule-prompts.json`.
+By default a job fires only in the session that created it — opening two pi sessions in the same directory won't double-fire schedules. To make a job fire in every pi session in this project on this profile (useful for hand-edited project-wide cron), remove its `session` field from the project's job file (see **Storage**; `cwd` in the file identifies the project).
 
 Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new jobs to session`. Flipping only affects future jobs.
 
@@ -210,8 +230,8 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 
 **Scheduler:**
 
-- Uses `croner` library for cron expressions
-- Native `setTimeout`/`setInterval` for intervals and one-shots
+- Uses `croner` library for cron expressions and one-shots
+- Native `setInterval` for intervals
 - Tracks: next run, last run, execution count, status (running/success/error)
 
 **Execution:**
@@ -236,7 +256,7 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 - Table mode shows: status icon, name, schedule (human-readable), prompt (truncated), next run, last run, run count
 - Human-readable formatting: "every minute", "daily", "Feb 13 15:30" instead of raw cron/ISO
 - Auto-refreshes every second
-- Visibility togglable via `/schedule-prompt → Settings`; persists across sessions (and package upgrades) in `<cwd>/.pi/schedule-prompts-settings.json`, with `~/.pi/agent/schedule-prompts-settings.json` as the global default
+- Visibility togglable via `/schedule-prompt → Settings`; persists across sessions (and package upgrades) in `<cwd>/.pi/schedule-prompts-settings.json` (trusted projects only), with `<agentDir>/schedule-prompts-settings.json` as the global default
 - Status icons: `✓` enabled, `✗` disabled, `⟳` running, `!` error, `⚠` last run succeeded but matched the anomaly regex
 - Quiet jobs (`displayOn` `anomaly`/`never`) carry a `~` suffix in their model badge — healthy ticks render nothing and land in the run archive instead
 
@@ -267,6 +287,21 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 "execute every minute"
   → schedule="0 * * * * *", type=cron
 ```
+
+### Idle jobs
+
+```
+"after 15 minutes idle, summarise what changed today"
+  → schedule="15m", type=idle
+```
+
+An idle job fires once you have been inactive for its duration, as soon as the agent is idle. Idle means pi has fully settled (its `agent_settled` event): no run, retry, compaction or queued follow-up is in progress.
+
+The clock measures your inactivity. It starts at session start and restarts when you send a message (counted from when that turn settles), abort a run, run a `!` command, or close a dialog such as the `/schedule-prompt` menus. Turns started by scheduled jobs and open question dialogs (select, confirm, input, editor) pause it but don't restart it, so a 5-minute heartbeat job can't keep a 15-minute idle job from firing. Overlays don't pause it, so a long-lived panel can't block idle jobs; in the Jobs view each key press restarts the clock, and its add flow pauses it like a question dialog. If an idle job comes due during such a turn, it fires right after that turn. A job you add or re-enable waits its full duration from that moment.
+
+It fires **once per idle stretch**. After it fires, it waits for your next message, `!` command or abort before it can fire again (closing a dialog only restarts the clock), so neither its own turn nor other scheduled jobs re-arm it. Reloading, resuming, forking or restarting pi starts a new stretch. Slash commands that open no dialog are not seen as activity. Combine it with `model` to run the maintenance in a subagent and keep your chat untouched.
+
+You don't need an idle job to keep the prompt cache warm. Pi does that natively (the `cacheWarming` setting, default `"idle"`).
 
 ### Heartbeat monitoring
 
@@ -323,7 +358,7 @@ Finished beat agents are evicted from `/agents` automatically about 10 minutes a
 
 Use `stopOn` for lifecycle completion instead of asking the background subagent to call `schedule_prompt`: scheduled subagents intentionally do not load extensions by default, so they cannot reliably remove their own parent job. For example, set `stopOn="DRIVER_DONE"` and make the prompt emit that literal marker only after final verification.
 
-> **Heads up:** Subagent jobs run unattended at fire time with the full default tool set (`bash`, `read`, `edit`, `write`, …) under your credentials. Treat persisted jobs in `.pi/schedule-prompts.json` as you would any auto-executed task — review prompts before adding, especially anything that mutates files or shells out.
+> **Heads up:** Subagent jobs run unattended at fire time with the full default tool set (`bash`, `read`, `edit`, `write`, …) under your credentials. Treat persisted jobs in the project's job file as you would any auto-executed task — review prompts before adding, especially anything that mutates files or shells out.
 
 ## Local fork maintenance
 
@@ -354,7 +389,7 @@ pi -e ./src/index.ts
 ```
 src/
   types.ts          # CronJob, CronJobType, CronToolParams
-  storage.ts        # Job persistence (.pi/schedule-prompts.json)
+  storage.ts        # Job persistence (<agentDir>/schedule-prompts/projects/<key>.json)
   settings.ts       # Settings persistence (global + project, project overrides)
   scheduler.ts      # Core scheduling engine with croner
   subagent.ts       # Lightweight in-process agent runner (per-task model)

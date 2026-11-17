@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { CronScheduler } from "../src/scheduler.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CronScheduler, displaySchedule, formatLocal } from "../src/scheduler.js";
 import type { CronJob } from "../src/types.js";
 
 // Mock the subagent runner: scheduler tests don't actually want to spin up an
@@ -338,6 +338,498 @@ describe("CronScheduler — subagent path marker delivery", () => {
     expect(errMsg.content[0].text).toBe("(subagent failed with empty error)");
   });
 
+describe("CronScheduler — once scheduling", () => {
+  it("schedules far-future one-shot jobs with Cron instead of a long timeout", () => {
+    const pi = makePi();
+    const target = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const job = exampleJob({
+      id: "far-once",
+      type: "once",
+      schedule: target.toISOString(),
+    });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    try {
+      scheduler.start();
+
+      const jobsMap = (scheduler as any).jobs as Map<string, unknown>;
+      const intervalsMap = (scheduler as any).intervals as Map<string, unknown>;
+      expect(jobsMap.has("far-once")).toBe(true);
+      expect(intervalsMap.has("far-once")).toBe(false);
+      expect(scheduler.getNextRun("far-once")?.toISOString()).toBe(target.toISOString());
+    } finally {
+      scheduler.stop();
+    }
+  });
+});
+
+describe("CronScheduler — interval scheduling", () => {
+  it("disables a stored interval over the timer limit instead of scheduling it", () => {
+    vi.useFakeTimers();
+    const pi = makePi();
+    const job = exampleJob({
+      id: "huge-interval",
+      type: "interval",
+      schedule: "30d",
+      intervalMs: 30 * 24 * 60 * 60 * 1000,
+    });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    try {
+      scheduler.start();
+      vi.advanceTimersByTime(100);
+
+      expect((scheduler as any).intervals.has("huge-interval")).toBe(false);
+      expect(storage.getJob("huge-interval")).toMatchObject({ enabled: false, lastStatus: "error" });
+      expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    } finally {
+      scheduler.stop();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("CronScheduler — idle scheduling", () => {
+  const MIN = 60 * 1000;
+
+  // ctx with controllable isIdle / hasPendingMessages.
+  function idleCtx(sessionId = "test-session") {
+    const state = { idle: true, pending: false };
+    const ctx = {
+      ...makeCtx(sessionId),
+      isIdle: () => state.idle,
+      hasPendingMessages: () => state.pending,
+    };
+    return { ctx: ctx as any, state };
+  }
+
+  function idleJob(overrides: Partial<CronJob> = {}): CronJob {
+    return exampleJob({
+      id: "idle-1",
+      type: "idle",
+      schedule: "10m",
+      intervalMs: 10 * MIN,
+      ...overrides,
+    });
+  }
+
+  function setup(jobs: CronJob[] = [idleJob()], sessionId?: string) {
+    const pi = makePi();
+    const storage = makeStorage(jobs);
+    const { ctx, state } = idleCtx(sessionId);
+    const scheduler = new CronScheduler(storage, pi, ctx);
+    return { pi, storage, state, scheduler };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("fires once the agent has been idle for the duration, counting from session start", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("do the thing", { deliverAs: "followUp" });
+    scheduler.stop();
+  });
+
+  it("pauses while busy; a user turn restarts the clock when it settles", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+
+    vi.advanceTimersByTime(9 * MIN);
+    scheduler.onUserInput();
+    scheduler.onBusy();
+    vi.advanceTimersByTime(30 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+    scheduler.onSettled();
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("scheduled turns don't restart the clock: a 5m heartbeat can't starve a 15m idle job", () => {
+    const { pi, scheduler } = setup([idleJob({ schedule: "15m", intervalMs: 15 * MIN })]);
+    scheduler.start();
+
+    // Another job's turn every 5 minutes (no user input).
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(5 * MIN - 10);
+      scheduler.onBusy();
+      vi.advanceTimersByTime(10);
+      scheduler.onSettled();
+    }
+    // 15m of user inactivity reached during the third turn; fires on its settle.
+    vi.advanceTimersByTime(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("an aborted run restarts the clock (the user is at the keyboard)", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(9 * MIN);
+    scheduler.onBusy();
+    scheduler.onSettled(true);
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("does not re-fire after its own turn settles; re-arms only after user input", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // The job's own turn runs and settles.
+    scheduler.onBusy();
+    scheduler.onSettled();
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // User types; their turn runs and settles: a new idle stretch.
+    scheduler.onUserActivity();
+    scheduler.onBusy();
+    scheduler.onSettled();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it("two inline idle jobs due together fire one turn at a time, not concurrent prompts", () => {
+    const { pi, scheduler } = setup([idleJob({ id: "a" }), idleJob({ id: "b", name: "b" })]);
+    scheduler.start();
+
+    // pi still reports idle while A's prompt is in preflight; B must wait.
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // A's run starts and settles; B is overdue and fires right after.
+    scheduler.onBusy();
+    scheduler.onSettled();
+    vi.advanceTimersByTime(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it("a second inline idle job still fires if the first prompt never starts a run", () => {
+    const { pi, scheduler } = setup([idleJob({ id: "a" }), idleJob({ id: "b", name: "b" })]);
+    scheduler.start();
+
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    // No agent_start (e.g. A's prompt failed preflight): B fires after the retry.
+    vi.advanceTimersByTime(5000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it("retries while pi is busy without a run (e.g. compacting) or has queued messages", () => {
+    const { pi, state, scheduler } = setup();
+    scheduler.start();
+
+    state.idle = false; // compaction: isIdle() false, no agent_start / agent_settled
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(scheduler.getNextRun("idle-1")).not.toBeNull();
+
+    state.idle = true;
+    state.pending = true;
+    vi.advanceTimersByTime(60 * 1000);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+    state.pending = false;
+    vi.advanceTimersByTime(5000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("never fires disabled or foreign-session idle jobs", () => {
+    const { pi, scheduler } = setup([
+      idleJob({ id: "off", enabled: false }),
+      idleJob({ id: "foreign", session: "other-session" }),
+    ]);
+    scheduler.start();
+    scheduler.onSettled();
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it("a job added after a long idle waits its full duration, not zero", () => {
+    const { pi, storage, scheduler } = setup([]);
+    scheduler.start();
+    vi.advanceTimersByTime(2 * 60 * MIN);
+
+    const job = idleJob();
+    storage.addJob(job);
+    scheduler.addJob(job);
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("re-enabling a job that already fired lets it fire again without new input", () => {
+    const { pi, storage, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    const job = storage.getJob("idle-1");
+    scheduler.updateJob("idle-1", { ...job, enabled: false });
+    scheduler.updateJob("idle-1", { ...job, enabled: true });
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it("only arms jobs this scheduler loaded, not ones another process added to the store", () => {
+    const { pi, storage, scheduler } = setup([]);
+    scheduler.start();
+    storage.addJob(idleJob({ id: "from-other-pi" }));
+    scheduler.onSettled();
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it("handled input that starts no run doesn't make a later scheduled turn count as the user's", () => {
+    const { pi, scheduler } = setup([idleJob({ schedule: "15m", intervalMs: 15 * MIN })]);
+    scheduler.start();
+    scheduler.onUserInput(); // e.g. another extension handled it: no run follows
+    vi.advanceTimersByTime(10 * MIN);
+    scheduler.onBusy(); // a scheduled turn, 10 minutes later
+    scheduler.onSettled();
+    vi.advanceTimersByTime(5 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("input while a scheduled turn runs makes that run the user's", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(5 * MIN);
+    scheduler.onBusy();
+    vi.advanceTimersByTime(8 * MIN);
+    scheduler.onUserInput(); // steer / queued follow-up
+    vi.advanceTimersByTime(MIN);
+    scheduler.onSettled();
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("an open custom overlay (e.g. the Jobs view) doesn't pause the clock", () => {
+    const { pi, storage, scheduler } = setup([]);
+    scheduler.start();
+    scheduler.onPromptStart("custom");
+    const job = idleJob({ schedule: "30s", intervalMs: 30_000 });
+    storage.addJob(job);
+    scheduler.addJob(job); // added from inside the overlay
+    vi.advanceTimersByTime(30_000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.onPromptEnd();
+    scheduler.stop();
+  });
+
+  it("keys in the Jobs view restart the clock; its add flow pauses it", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    scheduler.onPromptStart("custom"); // Jobs view opens
+    vi.advanceTimersByTime(9 * MIN);
+    scheduler.onUserPresent(); // a key press
+    vi.advanceTimersByTime(9 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    scheduler.pauseForDialog(); // add flow
+    vi.advanceTimersByTime(30 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    scheduler.resumeAfterDialog();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("Jobs view key presses don't let a fired job fire again", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(10 * MIN);
+    scheduler.onUserPresent();
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("closing a dialog restarts the clock but doesn't let a fired job fire again", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.onPromptStart("confirm");
+    scheduler.onPromptEnd(); // e.g. a dialog in the job's own turn timed out
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("editing an armed idle job keeps its due time", () => {
+    const { pi, storage, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(9 * MIN);
+    scheduler.updateJob("idle-1", { ...storage.getJob("idle-1"), description: "tweaked" });
+    vi.advanceTimersByTime(MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("a fire skipped because storage disabled the job doesn't use up the stretch", () => {
+    const { pi, storage, scheduler } = setup();
+    scheduler.start();
+    storage.updateJob("idle-1", { enabled: false }); // hand edit, no scheduler call
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    storage.updateJob("idle-1", { enabled: true });
+    scheduler.onBusy();
+    scheduler.onSettled();
+    vi.advanceTimersByTime(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("user activity without a run (a ! command) restarts the clock while idle", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(9 * MIN);
+    scheduler.onUserActivity();
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("an open dialog pauses the clock; closing it restarts it", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(5 * MIN);
+    scheduler.onPromptStart("select");
+    vi.advanceTimersByTime(30 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    scheduler.onPromptEnd();
+    vi.advanceTimersByTime(10 * MIN - 1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("editing an enabled idle job (e.g. from its own turn) does not re-arm it", () => {
+    const { pi, storage, scheduler } = setup();
+    scheduler.start();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    scheduler.onBusy();
+    scheduler.updateJob("idle-1", { ...storage.getJob("idle-1"), description: "tweaked" });
+    scheduler.onSettled();
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("arms at start even if pi is compacting, and fires once it is idle", () => {
+    const pi = makePi();
+    const { ctx, state } = idleCtx();
+    state.idle = false;
+    const scheduler = new CronScheduler(makeStorage([idleJob()]), pi, ctx);
+    scheduler.start();
+    vi.advanceTimersByTime(10 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    state.idle = true;
+    vi.advanceTimersByTime(5000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it("getNextRun never reports a past time while an overdue job waits for idle", () => {
+    const { state, scheduler } = setup();
+    scheduler.start();
+    state.idle = false;
+    vi.advanceTimersByTime(12 * MIN);
+    expect(scheduler.getNextRun("idle-1")!.getTime()).toBeGreaterThanOrEqual(Date.now());
+    scheduler.stop();
+  });
+
+  it("does not emit cron:change on a settle that leaves the timers unchanged", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    pi.events.emit.mockClear();
+    scheduler.onSettled();
+    expect(pi.events.emit).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it("emits cron:change when idle timers arm or disarm, so the widget redraws", () => {
+    const { pi, scheduler } = setup();
+    scheduler.start();
+    pi.events.emit.mockClear();
+    scheduler.onBusy();
+    expect(pi.events.emit).toHaveBeenCalledWith("cron:change", { type: "update" });
+    pi.events.emit.mockClear();
+    scheduler.onSettled();
+    expect(pi.events.emit).toHaveBeenCalledWith("cron:change", { type: "update" });
+    scheduler.stop();
+  });
+
+  it("removeJob and stop clear armed idle timers", () => {
+    const { pi, scheduler } = setup([idleJob({ id: "a" }), idleJob({ id: "b", name: "b" })]);
+    scheduler.start();
+    scheduler.removeJob("a");
+    scheduler.stop();
+    vi.advanceTimersByTime(60 * MIN);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("getNextRun reports last activity + duration while armed, null while busy", () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const { scheduler } = setup();
+    scheduler.start();
+    expect(scheduler.getNextRun("idle-1")?.toISOString()).toBe("2026-01-01T00:10:00.000Z");
+    scheduler.onBusy();
+    expect(scheduler.getNextRun("idle-1")).toBeNull();
+    scheduler.stop();
+  });
+
+  it("disables a stored idle job over the timer limit", () => {
+    const { pi, storage, scheduler } = setup([
+      idleJob({ schedule: "30d", intervalMs: 30 * 24 * 60 * MIN }),
+    ]);
+    scheduler.start();
+    vi.advanceTimersByTime(100);
+    expect(storage.getJob("idle-1")).toMatchObject({ enabled: false, lastStatus: "error" });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+});
+
 describe("CronScheduler — start() recovery", () => {
   it("clears stale lastStatus=running on start (interrupted-by-shutdown recovery)", () => {
     // Simulates the previous session crashing/aborting mid-execution: storage
@@ -632,10 +1124,42 @@ describe("CronScheduler.validateSchedule", () => {
     }
   });
 
+  it("interval: accepts 24d, the longest whole-day interval under the timer limit", () => {
+    const r = CronScheduler.validateSchedule("interval", "24d");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.intervalMs).toBe(24 * 24 * 60 * 60 * 1000);
+  });
+
+  it("interval: rejects intervals over the ~24.8-day timer limit and points to cron", () => {
+    for (const schedule of ["25d", "30d", "597h"]) {
+      const r = CronScheduler.validateSchedule("interval", schedule);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain("cron expression");
+    }
+  });
+
   it("interval: rejects garbage with a useful hint", () => {
     const r = CronScheduler.validateSchedule("interval", "five minutes");
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("'5m', '1h', '30s'");
+  });
+
+  it("idle: accepts a duration and returns intervalMs", () => {
+    const r = CronScheduler.validateSchedule("idle", "10m");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.schedule).toBe("10m");
+      expect(r.intervalMs).toBe(10 * 60 * 1000);
+    }
+  });
+
+  it("idle: rejects garbage and durations over the timer limit", () => {
+    const bad = CronScheduler.validateSchedule("idle", "ten minutes");
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.error).toContain("Invalid idle duration");
+    const long = CronScheduler.validateSchedule("idle", "25d");
+    expect(long.ok).toBe(false);
+    if (!long.ok) expect(long.error).toContain("too long");
   });
 
   it("once: accepts relative time and resolves to ISO", () => {
@@ -696,6 +1220,10 @@ describe("CronScheduler.describeSchedule", () => {
 
   it("interval: prefixes with 'every'", () => {
     expect(CronScheduler.describeSchedule("interval", "5m")).toBe("every 5m");
+  });
+
+  it("idle: renders 'after <duration> idle'", () => {
+    expect(CronScheduler.describeSchedule("idle", "10m")).toBe("after 10m idle");
   });
 
   it("once: renders ISO as 'Mon DD HH:MM'", () => {
@@ -1618,5 +2146,42 @@ describe("CronScheduler — shared-job cross-window claim", () => {
     const stored = storage.getJob(job.id)!;
     expect(stored.lastClaimAt).toBeUndefined();
     expect(stored.lastClaimSession).toBeUndefined();
+  });
+});
+
+describe("formatLocal / displaySchedule", () => {
+  const originalTz = process.env.TZ;
+  afterEach(() => {
+    if (originalTz === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTz;
+  });
+
+  // Zones without DST keep these expectations stable year-round.
+  it("renders local wall-clock time with a positive half-hour offset", () => {
+    process.env.TZ = "Asia/Kolkata";
+    expect(formatLocal("2026-11-16T12:00:00.000Z")).toBe("2026-11-16 17:30:00 +05:30");
+  });
+
+  it("renders a negative offset and rolls the date back", () => {
+    process.env.TZ = "Pacific/Honolulu";
+    expect(formatLocal(new Date("2026-11-16T05:04:03.000Z"))).toBe("2026-11-15 19:04:03 -10:00");
+  });
+
+  it("renders UTC as +00:00", () => {
+    process.env.TZ = "UTC";
+    expect(formatLocal("2026-01-02T03:04:05.000Z")).toBe("2026-01-02 03:04:05 +00:00");
+  });
+
+  it("returns unparseable input unchanged", () => {
+    expect(formatLocal("not a date")).toBe("not a date");
+  });
+
+  it("shows one-shot schedules in local time and leaves cron/interval unchanged", () => {
+    process.env.TZ = "Asia/Kolkata";
+    expect(displaySchedule({ type: "once", schedule: "2026-11-16T12:00:00.000Z" })).toBe(
+      "2026-11-16 17:30:00 +05:30",
+    );
+    expect(displaySchedule({ type: "cron", schedule: "0 0 9 * * *" })).toBe("0 0 9 * * *");
+    expect(displaySchedule({ type: "interval", schedule: "5m" })).toBe("5m");
   });
 });

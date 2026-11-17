@@ -1,9 +1,27 @@
-import { type Static, StringEnum, Type } from "@earendil-works/pi-ai";
+import { type Static, Type } from "typebox";
+
+/**
+ * String enum as `{ type: "string", enum: [...] }` (Google-compatible; a union of
+ * literals would emit `anyOf`). Same implementation as the `StringEnum` pi's
+ * extension view of pi-ai provides at runtime; defined locally because pi-ai's
+ * own export (>=1.5) returns a pi-schema type that TypeBox's `Static` can't infer.
+ */
+function StringEnum<T extends readonly string[]>(
+  values: T,
+  options?: { description?: string; default?: T[number] },
+) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: [...values],
+    ...(options?.description && { description: options.description }),
+    ...(options?.default && { default: options.default }),
+  });
+}
 
 /**
  * Type of cron job
  */
-export type CronJobType = "cron" | "once" | "interval";
+export type CronJobType = "cron" | "once" | "interval" | "idle";
 
 /**
  * Status of the last job execution
@@ -32,7 +50,7 @@ export interface CronJob {
   enabled: boolean;
   /** Type of job */
   type: CronJobType;
-  /** Interval in milliseconds (for interval type) */
+  /** Duration in milliseconds: the period for `interval`, the idle threshold for `idle` */
   intervalMs?: number;
   /** When the job was created */
   createdAt: string;
@@ -46,7 +64,7 @@ export interface CronJob {
   runCount: number;
   /** Optional description */
   description?: string;
-  /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */
+  /** If set, run the prompt in a separate in-process session under this model when the job fires, instead of injecting it into the current chat. */
   model?: string;
   /** Subagent jobs only. Legacy switch: true wakes the parent after every run. */
   notify?: boolean;
@@ -79,7 +97,7 @@ export interface CronJob {
   lastClaimSession?: string;
   /** Subagent jobs only. If true, loads all registered extensions. If an array of package names, only those extensions. Default undefined (none). */
   extensions?: boolean | string[];
-  /** Subagent jobs only. If true, loads all skills. If an array of skill names, only those skills. Default undefined (none). */
+  /** Only for jobs with `model` set. If true, loads all skills. If an array of skill names, only those skills. Default undefined (none). */
   skills?: boolean | string[];
   /** Session id this job is bound to. When absent, every pi in the cwd loads it. */
   session?: string;
@@ -89,6 +107,10 @@ export interface CronJob {
  * Persistent storage for cron jobs
  */
 export interface CronStore {
+  /** Canonical project path the store belongs to. Informational; the file name is the key. */
+  cwd?: string;
+  /** Set once the project's legacy `<cwd>/.pi/schedule-prompts.json` has been imported. */
+  legacyImported?: boolean;
   jobs: CronJob[];
   version: number;
 }
@@ -109,32 +131,34 @@ export interface CronToolDetails {
  */
 export const CronToolParams = Type.Object({
   action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "logs", "ask", "transcript"], {
-    description: "Action to perform",
+    description: "Action to perform. 'cleanup' deletes every disabled job.",
   }),
   name: Type.Optional(
     Type.String({
-      description: "Job name, auto-generated if omitted",
+      description: "Job name, unique among jobs. Auto-generated if omitted.",
     })
   ),
   schedule: Type.Optional(
     Type.String({
       description:
-        "Required for add. Cron expression, ISO timestamp, relative time (+10s, +5m), or interval string",
+        "Required for add. Format depends on 'type': cron = 6 fields 'sec min hour day month weekday' in local time ('0 */5 * * * *' = every 5 minutes); once = relative '+N' plus s/m/h/d ('+10m', '+2h') or an ISO timestamp at least 5s in the future; interval/idle = N plus s/m/h/d ('30s', '1h'), max 24d. On update, the new schedule must fit the job's existing type.",
     })
   ),
   prompt: Type.Optional(
     Type.String({
-      description: "Required for add. The prompt text to execute",
+      description:
+        "Required for add. The instruction to run when the job fires. Without 'model' it arrives in this chat as a user message, so write it as an instruction to yourself. With 'model' it is the whole task for a session that has no chat history, so include every detail it needs.",
     })
   ),
   jobId: Type.Optional(
     Type.String({
-      description: "Job ID for remove, enable, disable, or update actions",
+      description: "Job ID from the add or list output. Required for remove, enable, disable and update.",
     })
   ),
   type: Type.Optional(
-    StringEnum(["cron", "once", "interval"], {
-      description: "Job type. Use 'once' for relative times like '+10s'. Default is cron",
+    StringEnum(["cron", "once", "interval", "idle"], {
+      description:
+        "Job type; must match the schedule's format. 'cron' (default): recurring, 6-field cron. 'once': a single run at a relative ('+10s') or ISO time. 'interval': repeats every duration ('5m'). 'idle': fires once after the user has been inactive for the duration ('10m') and your current turn has finished; it re-arms only after new user activity. Cannot be changed by update.",
     })
   ),
   description: Type.Optional(
@@ -146,7 +170,7 @@ export const CronToolParams = Type.Object({
     Type.String({
       minLength: 1,
       description:
-        "Optional. If set, runs the prompt in a separate in-process agent session using this model (e.g. 'haiku', 'sonnet', or 'provider/model-id'). If omitted, the prompt is injected into the current chat. Must be a non-empty string — to switch a job from subagent back to inline mode, remove the job and re-add it without a model.",
+        "Optional. When the job fires, run its prompt in a separate session under this model (e.g. 'haiku', 'sonnet', or 'provider/model-id') instead of sending it to this chat. That session works in the same directory with bash/read/edit/write/grep/find/ls, but cannot see this conversation; a snippet of its reply is posted to this chat. Must be a non-empty string; to switch a job back to inline, remove and re-add it without 'model'.",
     })
   ),
   notify: Type.Optional(
@@ -216,20 +240,22 @@ export const CronToolParams = Type.Object({
   extensions: Type.Optional(
     Type.Union([
       Type.Boolean({
-        description: "If true, loads all registered extensions.",
+        description:
+          "Only for jobs with 'model' set. If true, the separate session loads all registered extensions and the full builtin toolset.",
       }),
       Type.Array(Type.String(), {
-        description: "List of extension package names to load.",
+        description:
+          "Only for jobs with 'model' set. The separate session loads only these extension package names, plus the full builtin toolset.",
       }),
     ])
   ),
   skills: Type.Optional(
     Type.Union([
       Type.Boolean({
-        description: "If true, loads all skills.",
+        description: "Only for jobs with 'model' set. If true, the separate session loads all skills.",
       }),
       Type.Array(Type.String(), {
-        description: "List of skill names to load.",
+        description: "Only for jobs with 'model' set. The separate session loads only these skill names.",
       }),
     ])
   ),

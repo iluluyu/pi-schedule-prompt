@@ -1,4 +1,9 @@
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  getAgentDir,
+  type UIPromptKind,
+} from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import * as path from "path";
 import { archiveRun, readRuns } from "./run-log.js";
@@ -23,6 +28,20 @@ type ValidateScheduleResult =
   | { ok: false; error: string };
 
 const SUBAGENT_OUTPUT_SNIPPET_LENGTH = 500;
+
+/** Longest delay Node timers accept (2^31−1 ms, ~24.8 days). Node replaces a
+ *  longer delay with 1 ms, so an interval above this would fire every
+ *  millisecond. */
+export const MAX_INTERVAL_MS = 2_147_483_647;
+
+/** How often an overdue idle job re-checks while pi is busy without a run
+ *  (e.g. compacting), since no agent_settled follows that. */
+const IDLE_RETRY_MS = 5_000;
+
+/** How soon after idle-time user input its run must start to count as the
+ *  user's turn. Input another extension handles starts no run, and must not
+ *  make a later scheduled run count as the user's. */
+const USER_TURN_START_WINDOW_MS = 5_000;
 
 /** Truncate `text` to `SUBAGENT_OUTPUT_SNIPPET_LENGTH`, appending an ellipsis if cut. */
 function snippet(text: string): string {
@@ -156,8 +175,38 @@ export class CronScheduler {
    *  so we track them ourselves for getNextRun / the widget countdown). */
   private readonly intervalNextAt = new Map<string, number>();
   private intervals = new Map<string, NodeJS.Timeout>();
+  /** Scheduled (enabled, loaded) `idle` jobs, with when each was scheduled.
+   *  A job never fires sooner than its full duration after being scheduled. */
+  private idleJobs = new Map<string, { job: CronJob; since: number }>();
+  /** Armed idle timers and the time each is due. Empty while the agent is busy. */
+  private idleTimers = new Map<string, { timer: NodeJS.Timeout; fireAt: number }>();
+  /** Start of the user's current inactivity (ms epoch): session start, the
+   *  user's last activity, or the settle of their last turn. Scheduled turns
+   *  don't move it. A scheduler is built per session, so this counts from then. */
+  private lastUserActivity = Date.now();
+  /** Idle-time user input arrived; a run starting before this time is theirs. */
+  private userTurnPendingUntil = 0;
+  /** The current run is the user's (or absorbed their input); its settle
+   *  restarts the idle clock. */
+  private userRun = false;
+  /** Between pi's `agent_start` and `agent_settled`. Starts false even if pi
+   *  is compacting: no agent_settled would follow, and the fire-time
+   *  isIdle() check retries until pi is idle. */
+  private busy = false;
+  /** A blocking extension dialog (select/confirm/input/editor/custom) is open. */
+  private promptOpen = false;
+  /** Idle jobs that already fired in the current idle stretch. Cleared only by
+   *  user input, so a job's own turn (or another job's) can't re-arm it. */
+  private firedThisStretch = new Set<string>();
+  /** When an inline idle job last sent its prompt, until that run's
+   *  `agent_start` (0 = none pending). pi reports idle while a prompt is still
+   *  in preflight, so without this a second idle job due in the same tick
+   *  would send a concurrent prompt that pi rejects. */
+  private inlineFireAt = 0;
   private activeSubagents = new Set<AbortController>();
   private activeJobs = new Set<string>();
+  /** Settles when each in-flight subagent run (including its session teardown) finishes. */
+  private inflightSubagents = new Set<Promise<void>>();
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly ctx: ExtensionContext;
@@ -223,9 +272,16 @@ export class CronScheduler {
   }
 
   /**
-   * Stop all scheduled jobs
+   * Stop all scheduled jobs and abort in-flight subagent runs.
+   *
+   * Timers are cleared synchronously. The returned promise settles once every
+   * aborted subagent run has finished tearing its session down (extension
+   * `session_shutdown` handlers included; each teardown step is time-bounded).
+   * Await it on pi shutdown: pi exits the process right after `session_shutdown`
+   * handlers resolve, which would otherwise orphan subagent extensions' child
+   * processes.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     this.stopped = true;
     // Abort any in-flight subagent runs so they don't keep streaming or post
     // markers against a stale pi reference after session shutdown.
@@ -253,6 +309,11 @@ export class CronScheduler {
       clearInterval(interval);
     }
     this.intervals.clear();
+
+    this.clearIdleTimers();
+    this.idleJobs.clear();
+
+    await Promise.allSettled([...this.inflightSubagents]);
   }
 
   /**
@@ -272,6 +333,7 @@ export class CronScheduler {
     this.disposeResident(id);
     this.residentHandoffs.delete(id);
     this.unscheduleJob(id);
+    this.firedThisStretch.delete(id);
     this.emitChange({ type: "remove", jobId: id });
   }
 
@@ -296,9 +358,15 @@ export class CronScheduler {
     ) {
       this.disposeResident(id);
     }
+    // Re-enabling a disabled idle job lets it fire again in this stretch and
+    // waits its full duration. Editing an enabled one (even from its own turn)
+    // keeps both its fired flag and its original start, so it neither re-arms
+    // nor gets pushed back.
+    const idlePrev = this.idleJobs.get(id);
+    if (!idlePrev) this.firedThisStretch.delete(id);
     this.unscheduleJob(id);
     if (updated.enabled) {
-      this.scheduleJob(updated);
+      this.scheduleJob(updated, idlePrev?.since);
     }
     this.emitChange({ type: "update", job: updated });
   }
@@ -307,6 +375,9 @@ export class CronScheduler {
    * Get next run time for a job
    */
   getNextRun(jobId: string): Date | null {
+    const idle = this.idleTimers.get(jobId);
+    // Clamped: an overdue job waiting for pi to go idle is due "now", not in the past.
+    if (idle) return new Date(Math.max(idle.fireAt, Date.now()));
     const cron = this.jobs.get(jobId);
     if (cron) {
       const next = cron.nextRun();
@@ -332,11 +403,182 @@ export class CronScheduler {
   }
 
   /**
+   * The agent finished all work (pi's `agent_settled`). Restarts the idle clock
+   * if this settle ends a user turn or an abort (the user is present); a turn
+   * started by a scheduled job leaves it running. Then arms every idle job that
+   * hasn't fired in this stretch; an overdue one fires right away.
+   */
+  onSettled(aborted = false): void {
+    this.busy = false;
+    if (this.userRun || aborted) this.lastUserActivity = Date.now();
+    this.userRun = false;
+    this.rearmIdleJobs();
+  }
+
+  /** The agent started a run: pause the idle timers until it settles. */
+  onBusy(): void {
+    this.busy = true;
+    this.inlineFireAt = 0;
+    if (Date.now() <= this.userTurnPendingUntil) this.userRun = true;
+    this.userTurnPendingUntil = 0;
+    this.disarmIdleJobs();
+  }
+
+  /**
+   * The user sent input. Like {@link onUserActivity}; in addition the run
+   * carrying it (the current one when steering or queueing, else the next one
+   * to start) is the user's, so the clock restarts again when it settles.
+   */
+  onUserInput(): void {
+    if (this.busy) this.userRun = true;
+    else this.userTurnPendingUntil = Date.now() + USER_TURN_START_WINDOW_MS;
+    this.onUserActivity();
+  }
+
+  /** The user did something (e.g. ran a `!` command): restart the idle clock
+   *  and start a new idle stretch. */
+  onUserActivity(): void {
+    this.firedThisStretch.clear();
+    this.restartIdleClock();
+  }
+
+  private restartIdleClock(): void {
+    this.lastUserActivity = Date.now();
+    this.rearmIdleJobs();
+  }
+
+  /**
+   * A blocking dialog opened. A question dialog (select/confirm/input/editor)
+   * means the user is at the keyboard, so pause. A `custom` overlay doesn't
+   * pause: it can stay open indefinitely (this extension's own Jobs view, or
+   * another extension's panel) and would otherwise freeze idle jobs. pi
+   * reports dialogs nested in an overlay as part of the overlay, so overlays
+   * that open dialogs report them with {@link pauseForDialog} themselves.
+   */
+  onPromptStart(kind: UIPromptKind): void {
+    if (kind === "custom") return;
+    this.pauseForDialog();
+  }
+
+  /** A question dialog is open: pause until {@link resumeAfterDialog}. */
+  pauseForDialog(): void {
+    this.promptOpen = true;
+    this.disarmIdleJobs();
+  }
+
+  /** The question dialog closed: unpause and restart the clock. */
+  resumeAfterDialog(): void {
+    this.promptOpen = false;
+    this.restartIdleClock();
+  }
+
+  /** The user is using this extension's UI (e.g. a key in the Jobs view):
+   *  restart the clock without starting a new stretch. */
+  onUserPresent(): void {
+    this.restartIdleClock();
+  }
+
+  /** The dialog closed. Restarts the clock but does not start a new stretch:
+   *  pi can't tell an answer from a timeout or abort, and a dialog opened by an
+   *  idle job's own turn must not let that job fire again. */
+  onPromptEnd(): void {
+    this.resumeAfterDialog();
+  }
+
+  private rearmIdleJobs(): void {
+    const before = this.idleTimerSnapshot();
+    for (const { job, since } of this.idleJobs.values()) this.armIdleJob(job, since);
+    if (this.idleTimerSnapshot() !== before) this.emitChange({ type: "update" });
+  }
+
+  private disarmIdleJobs(): void {
+    if (this.idleTimers.size === 0) return;
+    this.clearIdleTimers();
+    this.emitChange({ type: "update" });
+  }
+
+  /** Armed jobs and due times, to emit `cron:change` only when they change. */
+  private idleTimerSnapshot(): string {
+    return [...this.idleTimers].map(([id, { fireAt }]) => `${id}@${fireAt}`).join(",");
+  }
+
+  /** `ctx.isIdle()`, treating a context without it (tests, older hosts) as idle. */
+  private agentIdle(): boolean {
+    return this.ctx.isIdle?.() ?? true;
+  }
+
+  /** Arm an idle job's timer, due its duration after the later of the user's
+   *  last activity and when the job was scheduled. No-op while busy, while a
+   *  dialog is open, or once it fired in this stretch. An armed timer with the
+   *  same due time is left alone. */
+  private armIdleJob(job: CronJob, since: number): void {
+    if (this.busy || this.promptOpen || !job.intervalMs) return;
+    if (this.firedThisStretch.has(job.id)) return;
+    const fireAt = Math.max(this.lastUserActivity, since) + job.intervalMs;
+    if (this.idleTimers.get(job.id)?.fireAt === fireAt) return;
+    this.clearIdleTimer(job.id);
+    this.setIdleTimer(job, fireAt, fireAt - Date.now());
+  }
+
+  private setIdleTimer(job: CronJob, fireAt: number, delay: number): void {
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(job.id);
+      // pi can be busy without an agent_start (e.g. a manual /compact) and
+      // then never emits agent_settled; poll until it is idle again.
+      // An inline job's prompt from another idle job is still in preflight:
+      // wait for its run. Bounded, in case that prompt never starts a run.
+      const inlinePending = !job.model && Date.now() - this.inlineFireAt < IDLE_RETRY_MS;
+      if (!this.agentIdle() || this.ctx.hasPendingMessages?.() || inlinePending) {
+        this.setIdleTimer(job, fireAt, IDLE_RETRY_MS);
+        return;
+      }
+      // Mark fired only if executeJob will run it (it re-checks the same).
+      const fresh = this.storage.getJob(job.id);
+      if (!fresh?.enabled) return;
+      if (!CronScheduler.isLoadedFor(fresh, this.ctx.sessionManager.getSessionId())) return;
+      this.firedThisStretch.add(job.id);
+      if (!job.model) this.inlineFireAt = Date.now();
+      void this.executeJob(job);
+    }, Math.max(0, delay));
+    this.idleTimers.set(job.id, { timer, fireAt });
+  }
+
+  private clearIdleTimer(id: string): void {
+    const idle = this.idleTimers.get(id);
+    if (idle) {
+      clearTimeout(idle.timer);
+      this.idleTimers.delete(id);
+    }
+  }
+
+  private clearIdleTimers(): void {
+    for (const { timer } of this.idleTimers.values()) clearTimeout(timer);
+    this.idleTimers.clear();
+  }
+
+  /**
    * Schedule a single job
    */
-  private scheduleJob(job: CronJob): void {
+  private scheduleJob(job: CronJob, idleSince?: number): void {
     try {
-      if (job.type === "interval" && job.intervalMs) {
+      if ((job.type === "interval" || job.type === "idle") && job.intervalMs) {
+        // validateSchedule rejects these, but a store written by an older
+        // version or edited by hand can still hold one. Node fires an
+        // over-limit timer after 1 ms, so disable the job instead.
+        if (job.intervalMs > MAX_INTERVAL_MS) {
+          const error = `Duration ${job.schedule} exceeds the ~24-day timer limit; use a cron expression instead`;
+          console.warn(`Job ${job.id} (${job.name}): ${error}`);
+          this.storage.updateJob(job.id, { enabled: false, lastStatus: "error" });
+          this.emitChange({ type: "error", jobId: job.id, error });
+          return;
+        }
+      }
+      if (job.type === "idle" && job.intervalMs) {
+        const since = idleSince ?? Date.now();
+        this.idleJobs.set(job.id, { job, since });
+        // Armed now only if the agent is idle; otherwise on the next settle.
+        this.armIdleJob(job, since);
+      } else if (job.type === "interval" && job.intervalMs) {
         // Interval-based scheduling
         const intervalMs = job.intervalMs;
         const interval = setInterval(() => {
@@ -347,19 +589,18 @@ export class CronScheduler {
         this.intervalNextAt.set(job.id, Date.now() + intervalMs);
       } else if (job.type === "once") {
         // One-shot execution at a specific time
+        // Uses Cron with a Date instead of setTimeout to avoid the 32-bit
+        // integer overflow (~24.855 days max) that causes far-future jobs
+        // to fire immediately.
         const targetDate = new Date(job.schedule);
-        const now = new Date();
-        const delay = targetDate.getTime() - now.getTime();
-
-        if (delay > 0) {
-          const timeout = setTimeout(() => {
+        if (targetDate.getTime() > Date.now()) {
+          const cron = new Cron(targetDate, () => {
             this.executeJob(job);
             // Auto-disable one-shot jobs after execution
             this.storage.updateJob(job.id, { enabled: false });
             this.emitChange({ type: "update", job: { ...job, enabled: false } });
-          }, delay);
-          // Store as interval for cleanup purposes
-          this.intervals.set(job.id, timeout as any);
+          });
+          this.jobs.set(job.id, cron);
         } else {
           // Job is in the past - disable it and log warning
           console.warn(`Job ${job.id} (${job.name}) scheduled for past time: ${job.schedule}`);
@@ -406,6 +647,9 @@ export class CronScheduler {
       this.intervals.delete(id);
       this.intervalNextAt.delete(id);
     }
+
+    this.clearIdleTimer(id);
+    this.idleJobs.delete(id);
   }
 
   /**
@@ -737,7 +981,7 @@ export class CronScheduler {
    * `fast` are resolved at fire time for fresh jobs and pinned at creation
    * for resident ones.
    */
-  private async executeJobInSubagent(job: CronJob): Promise<void> {
+  private executeJobInSubagent(job: CronJob): Promise<void> {
     const startedAt = Date.now();
     const requestedModel = job.model!;
     const resolvedModel = resolveModel(this.ctx.modelRegistry, requestedModel, this.currentModel);
@@ -773,7 +1017,7 @@ export class CronScheduler {
           lastStatus: "error",
         });
         console.error(`Failed to post subagent_start marker for job ${job.id}:`, error);
-        return;
+        return Promise.resolve();
       }
     }
 
@@ -787,9 +1031,10 @@ export class CronScheduler {
       controller.abort();
     }, this.beatTimeoutMs);
 
-    try {
-      let result: SubagentResult;
-      if (job.resident) {
+    const run = (async () => {
+      try {
+        let result: SubagentResult;
+        if (job.resident) {
         try {
           const resident = await this.getOrCreateResident(job);
           if (!resident.ok) {
@@ -1056,12 +1301,16 @@ export class CronScheduler {
           }
         }
       }
-    } catch (error) {
-      // Backstop: storage or marker failures must not become unhandled rejections.
-      console.error(`Subagent completion handler failed for job ${job.id}:`, error);
-    } finally {
-      clearTimeout(beatDeadline);
-    }
+      } catch (error) {
+        // Backstop: storage or marker failures must not become unhandled rejections.
+        console.error(`Subagent completion handler failed for job ${job.id}:`, error);
+      } finally {
+        clearTimeout(beatDeadline);
+      }
+    })();
+    this.inflightSubagents.add(run);
+    void run.finally(() => this.inflightSubagents.delete(run));
+    return run;
   }
 
   /**
@@ -1146,15 +1395,28 @@ export class CronScheduler {
    * - `cron`: validates the 6-field expression
    * - `once`: accepts ISO timestamps and relative time (`+10s`); rejects past
    *   timestamps and ones <5s away (the agent should use relative time instead)
-   * - `interval`: accepts duration strings (`5m`, `1h`, `30s`)
+   * - `interval`: accepts duration strings (`5m`, `1h`, `30s`) up to 24 days
+   *   (`MAX_INTERVAL_MS`)
+   * - `idle`: same duration format and limit; the time the agent must be idle
    */
   static validateSchedule(type: CronJobType, schedule: string): ValidateScheduleResult {
-    if (type === "interval") {
+    if (type === "interval" || type === "idle") {
+      const label = type === "idle" ? "Idle duration" : "Interval";
       const intervalMs = CronScheduler.parseInterval(schedule);
       if (!intervalMs) {
         return {
           ok: false,
-          error: `Invalid interval format: ${schedule}. Use format like '5m', '1h', '30s'`,
+          error: `Invalid ${label.toLowerCase()} format: ${schedule}. Use format like '5m', '1h', '30s'`,
+        };
+      }
+      if (intervalMs > MAX_INTERVAL_MS) {
+        const hint =
+          type === "interval"
+            ? " For longer or calendar-based repeats, use a cron expression (e.g. '0 0 9 1 * *' = 9am on the 1st of each month)."
+            : "";
+        return {
+          ok: false,
+          error: `${label} ${schedule} is too long: limited to 24 days (24d).${hint}`,
         };
       }
       return { ok: true, schedule, intervalMs };
@@ -1175,7 +1437,7 @@ export class CronScheduler {
       if (delay < 0) {
         return {
           ok: false,
-          error: `Timestamp is in the past: ${date.toISOString()}. Current time: ${new Date().toISOString()}`,
+          error: `Timestamp is in the past: ${formatLocal(date)}. Current time: ${formatLocal(new Date())}`,
         };
       }
       if (delay < 5000) {
@@ -1202,6 +1464,7 @@ export class CronScheduler {
    */
   static describeSchedule(type: CronJobType, schedule: string): string {
     if (type === "interval") return `every ${schedule}`;
+    if (type === "idle") return `after ${schedule} idle`;
     if (type === "once") {
       const date = new Date(schedule);
       return Number.isNaN(date.getTime()) ? schedule : formatISOShort(date);
@@ -1260,4 +1523,29 @@ export function formatISOShort(input: Date | string): string {
   const hours = date.getHours().toString().padStart(2, "0");
   const minutes = date.getMinutes().toString().padStart(2, "0");
   return `${month} ${day} ${hours}:${minutes}`;
+}
+
+/** Local wall-clock time with its UTC offset: "2026-11-16 10:30:00 -03:00".
+ *  Used wherever a time is shown to the user or the model, so it matches the
+ *  time the user means ("at 5pm") while the offset keeps it unambiguous.
+ *  Stored values stay UTC ISO. Returns the input unchanged if it doesn't
+ *  parse as a date. */
+export function formatLocal(input: Date | string): string {
+  const date = typeof input === "string" ? new Date(input) : input;
+  if (Number.isNaN(date.getTime())) return String(input);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const offset = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${offset}`
+  );
+}
+
+/** A job's schedule as shown to the user or the model: one-shot ISO
+ *  timestamps in local time, cron and interval strings unchanged. */
+export function displaySchedule(job: Pick<CronJob, "type" | "schedule">): string {
+  return job.type === "once" ? formatLocal(job.schedule) : job.schedule;
 }

@@ -615,7 +615,7 @@ describe("schedule_prompt — logs action", () => {
         undefined,
         makeCtx(),
       );
-      const text = (result.content as { type: string; text }[])[0].text;
+      const text = (result.content as { type: string; text: string }[])[0].text;
       expect(result.details?.error).toBeUndefined();
       expect(text).toContain("hb (sumjob1234)");
       expect(text).toContain("runs=7");
@@ -738,5 +738,64 @@ describe("schedule_prompt — ask action + resident wiring", () => {
     const text = (result.content as { type: string; text: string }[])[0].text;
     expect(text).toContain("beats=2");
     expect(text).toContain("assistant: STATUS: ok");
+  });
+});
+
+describe("schedule_prompt — idle jobs", () => {
+  it("add with type='idle' stores the duration and intervalMs", async () => {
+    const { tool, storage } = buildTool();
+    const result = await tool.execute(
+      "call-1",
+      { action: "add", name: "nightly-cleanup", schedule: "15m", prompt: "tidy up", type: "idle" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const job = storage.getAllJobs()[0];
+    expect(job).toMatchObject({ type: "idle", schedule: "15m", intervalMs: 15 * 60 * 1000 });
+    expect(result.content[0]).toMatchObject({ type: "text" });
+  });
+
+  it("add with type='idle' rejects a non-duration schedule", async () => {
+    const { tool, storage } = buildTool();
+    const result = await tool.execute(
+      "call-1",
+      { action: "add", schedule: "0 * * * * *", prompt: "x", type: "idle" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details.error).toContain("Invalid idle duration");
+    expect(storage.getAllJobs()).toHaveLength(0);
+  });
+});
+
+describe("schedule_prompt — update rename", () => {
+  it("rejects renaming a job to another job's name", async () => {
+    const { tool, storage } = buildTool([
+      exampleJob({ id: "a000000001", name: "first" }),
+      exampleJob({ id: "b000000002", name: "backup" }),
+    ]);
+    const result = await tool.execute(
+      "call-1",
+      { action: "update", jobId: "a000000001", name: "backup" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details.error).toContain('already exists');
+    expect(storage.getJob("a000000001").name).toBe("first");
+  });
+
+  it("allows an update that repeats the job's own name", async () => {
+    const { tool } = buildTool([exampleJob({ id: "a000000001", name: "first" })]);
+    const result = await tool.execute(
+      "call-1",
+      { action: "update", jobId: "a000000001", name: "first", prompt: "new" },
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details.error).toBeUndefined();
   });
 });
